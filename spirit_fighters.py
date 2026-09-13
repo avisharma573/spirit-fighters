@@ -92,9 +92,34 @@ CFG = Cfg(
         color_step=12,
         cache_max=192,
     ),
+    motion=Cfg(                 # PHASE B — skeleton, IK, procedural locomotion
+        substep=1 / 120.0,      # springs integrate at a fixed rate, always
+        max_substeps=6,
+        thigh=40, shin=40,      # bone lengths in design units (scaled by depth)
+        upper_arm=27, forearm=25,
+        hip_h=74, chest_h=120, head_h=150,   # rest heights above the feet
+        shoulder_w=11, stance_width=19,
+        stride=52,              # distance between footfalls
+        gap_trigger=0.42,       # step when hips outrun the planted foot by this
+        plant_ahead=0.52,       # how far ahead of the hips the foot lands
+        swing_time=0.17,        # seconds a foot spends in the air
+        step_lift=17,           # how high the swing foot arcs
+        replant_dist=115,       # beyond this the feet snap (dash, knockback)
+        lean_k=150.0, lean_d=15.0, lean_per_speed=0.030, lean_max=10.0,
+        head_k=190.0, head_d=16.0, head_look=0.10, head_max=9.0,
+        chest_k=240.0, chest_d=17.0,
+        breath_rate=2.3, breath_amp=2.6,
+        weight_shift=2.2,       # idle hip sway amplitude
+        hit_impulse=190.0,      # spring kick per unit of damage direction
+        ragdoll_blend=0.15,     # seconds to go from animated to full physics
+        ragdoll_gravity=2300.0,
+        ragdoll_damping=0.985,
+        limb_taper=0.62,        # extremity width as a fraction of the root width
+    ),
     debug=Cfg(
         overlay=False,          # F3 toggles the frame-time readout
         samples=90,             # rolling window for the ms/frame average
+        skeleton=False,         # F4 draws the joints and foot plants
     ),
 )
 
@@ -332,6 +357,27 @@ def limb(a, b, w, col, surf=None):
     pygame.draw.line(surf, col, a, b, w)
     pygame.draw.circle(surf, col, ipt(a), w // 2)
     pygame.draw.circle(surf, col, ipt(b), w // 2)
+
+
+def taper(surf, a, b, w1, w2, col):
+    """A capsule that narrows from w1 to w2 — thicker at the torso, thinner at
+    the extremities. Drawn into the supersampled buffer, so its edges come out
+    anti-aliased after the downscale."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    d = math.hypot(dx, dy) or 1e-5
+    nx, ny = -dy / d * 0.5, dx / d * 0.5
+    pygame.draw.polygon(surf, col, [
+        (a[0] + nx * w1, a[1] + ny * w1), (b[0] + nx * w2, b[1] + ny * w2),
+        (b[0] - nx * w2, b[1] - ny * w2), (a[0] - nx * w1, a[1] - ny * w1)])
+    pygame.draw.circle(surf, col, (int(a[0]), int(a[1])), int(w1 * 0.5))
+    pygame.draw.circle(surf, col, (int(b[0]), int(b[1])), int(w2 * 0.5))
+
+
+# Figures are rendered at SS× into this scratch buffer and scaled down, which
+# anti-aliases the entire silhouette in one pass. Allocated once, never resized.
+SS = 2
+FIG_W, FIG_H = 460, 380
+_fig_buf = pygame.Surface((FIG_W * SS, FIG_H * SS), pygame.SRCALPHA)
 
 
 def shade(col, f):
@@ -635,6 +681,352 @@ class Zone:
 
 
 # --------------------------------------------------------------------------
+# PHASE B — skeleton, inverse kinematics and procedural locomotion
+#
+# The figure is still a stick. Everything that makes it read as a body comes
+# from motion: joints solved by IK rather than placed, feet that own a point on
+# the ground and refuse to slide off it, and springs that let limbs overshoot
+# and settle instead of snapping to a pose.
+# --------------------------------------------------------------------------
+def lerp(a, b, u):
+    return a + (b - a) * u
+
+
+def smoothstep(u):
+    u = max(0.0, min(1.0, u))
+    return u * u * (3 - 2 * u)
+
+
+def ik2(root, target, l1, l2, bend):
+    """Two-bone IK.
+
+    Returns (joint, end): the elbow/knee position, and the end effector after
+    clamping to what the chain can actually reach — so a limb stretched past
+    its length bends instead of detaching.
+    """
+    dx, dy = target[0] - root[0], target[1] - root[1]
+    raw = math.hypot(dx, dy) or 1e-5
+    ux, uy = dx / raw, dy / raw
+    d = min(raw, l1 + l2 - 0.001)
+    a = (d * d + l1 * l1 - l2 * l2) / (2 * d)
+    h = math.sqrt(max(0.0, l1 * l1 - a * a))
+    joint = (root[0] + ux * a - uy * h * bend, root[1] + uy * a + ux * h * bend)
+    return joint, (root[0] + ux * d, root[1] + uy * d)
+
+
+def ik2_dir(root, target, l1, l2, px, py):
+    """IK, choosing the bend whose joint lies further along (px, py).
+
+    Picking the elbow/knee side by a preferred direction rather than a hard sign
+    is what keeps knees pointing forward and elbows hanging down through every
+    pose — a fixed sign flips to the wrong side as the target crosses the body.
+    """
+    ja, end = ik2(root, target, l1, l2, 1.0)
+    jb, _ = ik2(root, target, l1, l2, -1.0)
+    sa = (ja[0] - root[0]) * px + (ja[1] - root[1]) * py
+    sb = (jb[0] - root[0]) * px + (jb[1] - root[1]) * py
+    return (ja if sa >= sb else jb), end
+
+
+class Spring:
+    """Damped spring. Secondary motion lives here: overshoot, then settle."""
+    __slots__ = ("v", "vel", "k", "d")
+
+    def __init__(self, v=0.0, k=180.0, d=16.0):
+        self.v = v; self.vel = 0.0; self.k = k; self.d = d
+
+    def step(self, target, dt):
+        self.vel += (target - self.v) * self.k * dt
+        self.vel -= self.vel * min(1.0, self.d * dt)
+        self.v += self.vel * dt
+        return self.v
+
+    def kick(self, amount):
+        self.vel += amount
+
+
+class Ragdoll:
+    """Verlet points + distance constraints. Used for the death fall."""
+
+    def __init__(self, pts, links, ground):
+        self.p = [[x, y] for x, y in pts]
+        self.old = [[x, y] for x, y in pts]
+        self.links = links
+        self.ground = ground
+
+    def step(self, dt):
+        g = CFG.motion.ragdoll_gravity * dt * dt
+        damp = CFG.motion.ragdoll_damping
+        for i, pt in enumerate(self.p):
+            ox, oy = self.old[i]
+            nx = pt[0] + (pt[0] - ox) * damp
+            ny = pt[1] + (pt[1] - oy) * damp + g
+            self.old[i] = [pt[0], pt[1]]
+            pt[0], pt[1] = nx, ny
+        for _ in range(4):                       # constraint relaxation
+            for i, j, rest in self.links:
+                a, b = self.p[i], self.p[j]
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                d = math.hypot(dx, dy) or 1e-5
+                corr = (d - rest) / d * 0.5
+                a[0] += dx * corr; a[1] += dy * corr
+                b[0] -= dx * corr; b[1] -= dy * corr
+            for k, pt in enumerate(self.p):
+                if pt[1] > self.ground:
+                    pt[1] = self.ground
+                    self.old[k][0] += (pt[0] - self.old[k][0]) * 0.45   # friction
+
+
+class Skeleton:
+    """Persistent pose state for one fighter.
+
+    Joint positions are recomputed each frame, but *plant points*, spring
+    velocities and stride phase persist — that persistence is what stops the
+    walk being a sine wave and makes hits overshoot.
+    """
+
+    def __init__(self, f):
+        self.f = f
+        m = CFG.motion
+        s = f.scale()
+        self.lean = Spring(0.0, m.lean_k, m.lean_d)
+        self.head = Spring(0.0, m.head_k, m.head_d)
+        self.chest = Spring(0.0, m.chest_k, m.chest_d)
+        # feet own world-space ground points; [x, y, lift]
+        self.feet = [[f.x - m.stance_width * s, f.y, 0.0],
+                     [f.x + m.stance_width * s, f.y, 0.0]]
+        self.stance = 0              # index of the planted foot
+        self.swing_t = 1.0           # 1.0 = both feet down
+        self.swing_from = (f.x, f.y)
+        self.swing_to = (f.x, f.y)
+        self.travel = 0.0
+        self.breath = random.random() * 6.0
+        self.sway = random.random() * 6.0
+        self.acc = 0.0
+        self.rag = None
+        self.rag_blend = 0.0
+        self.last_plant = None       # (x, y) consumed by the dust/audio systems
+
+    # ---- events ---------------------------------------------------------
+    def impulse(self, direction, power):
+        """An incoming hit shoves the spine and snaps the head."""
+        self.lean.kick(direction * power * CFG.motion.hit_impulse * 0.01)
+        self.head.kick(direction * power * CFG.motion.hit_impulse * 0.016)
+        self.chest.kick(-abs(power) * 0.18)
+
+    def snap_feet(self):
+        m = CFG.motion
+        s = self.f.scale()
+        self.feet[0] = [self.f.x - m.stance_width * s, self.f.y, 0.0]
+        self.feet[1] = [self.f.x + m.stance_width * s, self.f.y, 0.0]
+        self.swing_t = 1.0
+        self.travel = 0.0
+
+    def start_ragdoll(self, joints):
+        order = ["head", "neck", "hip", "hand_b", "hand_f",
+                 "elbow_b", "elbow_f", "knee_b", "knee_f", "foot_b", "foot_f"]
+        pts = [joints[k] for k in order]
+        idx = {k: i for i, k in enumerate(order)}
+        pairs = [("head", "neck"), ("neck", "hip"),
+                 ("neck", "elbow_b"), ("elbow_b", "hand_b"),
+                 ("neck", "elbow_f"), ("elbow_f", "hand_f"),
+                 ("hip", "knee_b"), ("knee_b", "foot_b"),
+                 ("hip", "knee_f"), ("knee_f", "foot_f"),
+                 ("head", "hip")]
+        links = []
+        for a, b in pairs:
+            pa, pb = joints[a], joints[b]
+            links.append((idx[a], idx[b], math.hypot(pb[0] - pa[0], pb[1] - pa[1])))
+        self.rag = Ragdoll(pts, links, self.f.y)
+        self.rag_blend = 0.0
+
+    # ---- integration ----------------------------------------------------
+    def update(self, dt):
+        """Fixed-rate substeps so spring behaviour never depends on framerate."""
+        self.acc += dt
+        step = CFG.motion.substep
+        n = 0
+        while self.acc >= step and n < CFG.motion.max_substeps:
+            self._step(step)
+            self.acc -= step
+            n += 1
+        if n == CFG.motion.max_substeps:
+            self.acc = 0.0
+
+    def _step(self, dt):
+        f = self.f
+        m = CFG.motion
+        s = f.scale()
+        self.breath += dt * m.breath_rate
+        self.sway += dt * 1.15
+
+        if self.rag is not None:
+            self.rag.step(dt)
+            self.rag_blend = min(1.0, self.rag_blend + dt / max(m.ragdoll_blend, 1e-4))
+            return
+
+        # --- centre of mass leans into acceleration, springs back out of it
+        target_lean = max(-m.lean_max, min(m.lean_max, f.vx * m.lean_per_speed))
+        if f.stun > 0:
+            target_lean += math.sin(self.breath * 9) * 5
+        self.lean.step(target_lean, dt)
+
+        # --- head tracks the opponent, within a limit
+        other = e if f.player else p
+        look = 0.0
+        if other is not None and other is not f:
+            look = max(-m.head_max, min(m.head_max, (other.x - f.x) * m.head_look * 0.1))
+        self.head.step(look, dt)
+        self.chest.step(0.0, dt)
+
+        # --- locomotion: feet are placed by distance travelled, never by a clock
+        speed = math.hypot(f.vx, f.vy)
+        mid = (self.feet[0][0] + self.feet[1][0]) * 0.5
+        if abs(f.x - mid) > m.replant_dist * s:      # dash / big knockback
+            self.snap_feet()
+            return
+
+        if self.swing_t < 1.0:
+            self.swing_t = min(1.0, self.swing_t + dt / max(m.swing_time, 1e-4))
+            sw = self.stance ^ 1
+            u = smoothstep(self.swing_t)
+            foot = self.feet[sw]
+            foot[0] = lerp(self.swing_from[0], self.swing_to[0], u)
+            foot[1] = lerp(self.swing_from[1], self.swing_to[1], u)
+            foot[2] = math.sin(self.swing_t * math.pi) * m.step_lift * s
+            if self.swing_t >= 1.0:
+                foot[2] = 0.0
+                self.last_plant = (foot[0], foot[1])   # footfall event
+        else:
+            stride = m.stride * s
+            need_step = False
+            dirx, diry = 0.0, 0.0
+            stance_foot = self.feet[self.stance]
+            gap = math.hypot(f.x - stance_foot[0], (f.y - stance_foot[1]) * 1.6)
+            if speed > 12:
+                dirx, diry = f.vx / speed, f.vy / speed
+                # step once the hips have outrun the planted foot, so the leg
+                # can never stretch further than one stride
+                need_step = gap > stride * m.gap_trigger
+            elif gap > m.stance_width * s * 1.5:
+                need_step = True                       # drifted; re-centre
+                dirx = 1.0 if f.x > stance_foot[0] else -1.0
+
+            if need_step:
+                self.travel = 0.0
+                self.stance ^= 1
+                sw = self.stance ^ 1
+                perpx, perpy = -diry, dirx
+                lat = (m.stance_width * s) * (1 if sw == 1 else -1)
+                self.swing_from = (self.feet[sw][0], self.feet[sw][1])
+                self.swing_to = (f.x + dirx * stride * m.plant_ahead + perpx * lat,
+                                 max(GROUND_TOP, min(GROUND_BOTTOM,
+                                     f.y + diry * stride * m.plant_ahead * 0.6
+                                     + perpy * lat * 0.4)))
+                self.swing_t = 0.0
+
+    # ---- pose -----------------------------------------------------------
+    def joints(self):
+        """Solve the whole figure for this frame and hand back named points."""
+        f = self.f
+        m = CFG.motion
+        s = f.scale()
+        fc = f.facing
+
+        phase = 0.0
+        if f.atk > 0:
+            phase = max(0.0, min(1.0, 1 - f.atk / max(f.atk_dur, 1e-3)))
+        # anticipation -> strike -> recovery, instead of a plain sine
+        if phase < 0.26:
+            drive = -0.34 * smoothstep(phase / 0.26)        # wind up, pull back
+        elif phase < 0.56:
+            drive = lerp(-0.34, 1.0, smoothstep((phase - 0.26) / 0.30))
+        else:
+            drive = lerp(1.0, 0.0, smoothstep((phase - 0.56) / 0.44))
+        atk = f.atk > 0
+        kind = f.atype if atk else "idle"
+
+        breath = math.sin(self.breath) * m.breath_amp * s
+        shift = math.sin(self.sway) * m.weight_shift * s
+        moving = math.hypot(f.vx, f.vy) > 12
+
+        lean = self.lean.v
+        if atk and kind == "punch":
+            lean += fc * 13 * max(0.0, drive)
+        elif atk and kind == "kick":
+            lean -= fc * 15 * max(0.0, drive)
+        elif atk:
+            lean -= fc * 6 * max(0.0, drive)
+
+        hip = [f.x + shift * 0.5, f.y - m.hip_h * s + self.chest.v * 0.4]
+        neck = [f.x + lean * 0.55 + shift * 0.3,
+                f.y - m.chest_h * s - breath * 0.35 + self.chest.v]
+        head = [neck[0] + fc * 4 * s + self.head.v * 0.5,
+                neck[1] - (m.head_h - m.chest_h) * s - breath * 0.2]
+
+        J = {"hip": tuple(hip), "neck": tuple(neck), "head": tuple(head)}
+
+        # --- legs: the planted foot is authoritative, the knee follows
+        thigh, shin = m.thigh * s, m.shin * s
+        kick_foot = None
+        if atk and kind == "kick":
+            chamber = smoothstep(min(1.0, phase / 0.32))
+            kick_foot = (f.x + fc * (26 + 112 * max(0.0, drive)) * s,
+                         f.y - (52 + 30 * chamber - 10 * max(0.0, drive)) * s)
+        for i, tag in ((0, "b"), (1, "f")):
+            fx, fy, lift = self.feet[i]
+            target = (fx, fy - lift)
+            hip_pt = (hip[0] + (-1 if i == 0 else 1) * 3 * s, hip[1])
+            if kick_foot is not None and i == 1:
+                target = kick_foot
+            knee, foot = ik2_dir(hip_pt, target, thigh, shin, fc, 0.30)
+            J["knee_" + tag] = knee
+            J["foot_" + tag] = foot
+
+        # --- arms
+        ua, fa = m.upper_arm * s, m.forearm * s
+        sh_b = (neck[0] - fc * m.shoulder_w * s, neck[1] + 7 * s)
+        sh_f = (neck[0] + fc * m.shoulder_w * s, neck[1] + 6 * s)
+        J["sh_b"], J["sh_f"] = sh_b, sh_f
+
+        # Hands are placed relative to the shoulders, far enough out that the
+        # arm keeps a natural bend. Tucked closer, the chain folds so hard the
+        # elbow has nowhere to go but sideways, which reads as a chicken wing.
+        guard_b = (sh_b[0] + fc * 27 * s, sh_b[1] - 17 * s + breath * 0.3)
+        guard_f = (sh_f[0] + fc * 30 * s, sh_f[1] - 12 * s - breath * 0.3)
+        if atk and kind == "punch":
+            hand_f = (f.x + fc * (26 + 84 * max(0.0, drive)) * s, neck[1] + 3 * s)
+            hand_b = (sh_b[0] + fc * 24 * s, sh_b[1] - 19 * s)
+        elif atk and kind == "cast":
+            hand_f = (f.x + fc * (26 + 34 * max(0.0, drive)) * s,
+                      neck[1] - (24 + 30 * max(0.0, drive)) * s)
+            hand_b = (sh_b[0] + fc * 26 * s, sh_b[1] - 4 * s)
+        elif atk and kind == "kick":
+            hand_f = (sh_f[0] + fc * 26 * s, sh_f[1] - 24 * s)
+            hand_b = (sh_b[0] - fc * 22 * s, sh_b[1] - 6 * s)
+        else:
+            drift = 3 * s if moving else 0.0
+            hand_f = (guard_f[0] + fc * drift, guard_f[1])
+            hand_b = (guard_b[0] - fc * drift, guard_b[1])
+
+        for sh, hand, tag in ((sh_b, hand_b, "b"), (sh_f, hand_f, "f")):
+            elbow, end = ik2_dir(sh, hand, ua, fa, -fc * 0.25, 1.0)
+            J["elbow_" + tag] = elbow
+            J["hand_" + tag] = end
+
+        if self.rag is not None:                 # blend animation -> physics
+            order = ["head", "neck", "hip", "hand_b", "hand_f",
+                     "elbow_b", "elbow_f", "knee_b", "knee_f", "foot_b", "foot_f"]
+            u = smoothstep(self.rag_blend)
+            for i, kname in enumerate(order):
+                rx, ry = self.rag.p[i]
+                ax, ay = J[kname]
+                J[kname] = (lerp(ax, rx, u), lerp(ay, ry, u))
+            J["sh_b"] = J["neck"]; J["sh_f"] = J["neck"]
+        return J
+
+
+# --------------------------------------------------------------------------
 # fighter
 # --------------------------------------------------------------------------
 class Fighter:
@@ -654,7 +1046,9 @@ class Fighter:
         self.combo = 0; self.combo_t = 0.0
         self.hitstop = 0.0; self.flinch = 0.0
         self.moving = False; self.px = self.x; self.py = self.y
+        self.vx = 0.0; self.vy = 0.0                     # px/s, drives lean + stride
         self.kx = 0.0                                    # knockback velocity
+        self.skel = Skeleton(self)
         # modifiers (the shop writes these)
         self.dmg_mult = 1.0; self.ability_mult = 1.0; self.armor = 1.0
         self.lifesteal = 0.0; self.cdr = 1.0; self.ult_rate = 1.0; self.proj = 1.0
@@ -675,12 +1069,21 @@ class Fighter:
         self.hp = max(0.0, self.hp - damage)
         self.ult = min(100.0, self.ult + damage * 0.12)
         self.flinch = 0.16
+        # the spine and head absorb the blow, overshoot, then settle
+        other = e if self.player else p
+        direction = 1.0
+        if other is not None and other is not self:
+            direction = 1.0 if self.x >= other.x else -1.0
+        self.skel.impulse(direction, min(40.0, damage))
         floaters.append(FloatingText(self.x, self.y - 118, f"-{int(damage)}", RED))
         burst(self.x, self.y - 90 * self.scale(), self.b, 9, 130, 4)
         if self.player:
             add_flash(22)
         if self.hp <= 0:
             self.alive = False
+            self.skel.start_ragdoll(self.skel.joints())
+            self.skel.rag.p[1][0] += direction * 40      # throw the torso back
+            self.skel.rag.p[0][0] += direction * 55
             burst(self.x, self.y - 80, self.b, 55, 300, 7)
             smoke(self.x, self.y - 60, (70, 70, 80), 14)
             add_shake(14)
@@ -923,9 +1326,6 @@ class Fighter:
     # ---- per-frame ------------------------------------------------------
     def up(self, dt):
         self.anim += dt
-        moved = math.hypot(self.x - self.px, self.y - self.py)
-        self.moving = moved > 0.4
-        self.px, self.py = self.x, self.y
 
         if self.kx:                                    # knockback slide with friction
             self.x += self.kx * dt * 12
@@ -933,6 +1333,16 @@ class Fighter:
             if abs(self.kx) < 0.4:
                 self.kx = 0.0
             self.clamp()
+
+        # velocity is measured after every positional change this frame, so the
+        # lean and the stride react to knockback as well as to input
+        if dt > 1e-6:
+            self.vx = (self.x - self.px) / dt
+            self.vy = (self.y - self.py) / dt
+        moved = math.hypot(self.x - self.px, self.y - self.py)
+        self.moving = moved > 0.4
+        self.px, self.py = self.x, self.y
+        self.skel.update(dt)
 
         self.hitstop = max(0.0, self.hitstop - dt)
         self.flinch = max(0.0, self.flinch - dt)
@@ -957,169 +1367,129 @@ class Fighter:
 
     # ---- rendering ------------------------------------------------------
     def draw(self):
-        x, y, f = self.x, self.y, self.facing
         s = self.scale()
+        fc = self.facing
+        J = self.skel.joints()
+        acc = self.b
         body = shade(self.c, 1.0)
         dark = shade(self.c, 0.55)      # limbs on the far side of the body
         lite = shade(self.c, 1.55)      # limbs on the near side — reads as lit
-        acc = self.b
-        if self.flinch > 0:                              # hit flash
-            body = shade(body, 1.0 + self.flinch * 3)
-            dark = shade(dark, 1.0 + self.flinch * 3)
-            lite = shade(lite, 1.0 + self.flinch * 3)
+        if self.flinch > 0:
+            k = 1.0 + self.flinch * 3
+            body, dark, lite = shade(body, k), shade(dark, k), shade(lite, k)
 
-        phase = 0.0
-        if self.atk > 0:
-            phase = max(0.0, min(1.0, 1 - self.atk / max(self.atk_dur, 1e-3)))
-        swing = math.sin(phase * math.pi) if self.atk > 0 else 0.0
-        kicking = self.atk > 0 and self.atype == "kick"
-        punching = self.atk > 0 and self.atype == "punch"
-        casting = self.atk > 0 and self.atype == "cast"
-        walking = self.moving and self.atk <= 0 and self.stun <= 0
+        # --- contact shadow: shrinks and fades as the hips leave the ground
+        rest_h = CFG.motion.hip_h * s
+        lift = max(0.0, (self.y - J["hip"][1]) - rest_h * 0.55) / max(rest_h, 1e-3)
+        tight = max(0.35, 1.0 - lift * 0.8)
+        sw, sh_ = int(104 * s * tight), int(27 * s * tight)
+        if sw > 1 and sh_ > 1:
+            sh_surf = pygame.Surface((sw, sh_), pygame.SRCALPHA)
+            pygame.draw.ellipse(sh_surf, (0, 0, 0, int(125 * tight)), sh_surf.get_rect())
+            screen.blit(sh_surf, (J["hip"][0] - sw / 2, self.y - sh_ * 0.35))
 
-        # ground contact shadow, softened and scaled with depth
-        sh = pygame.Surface((int(96 * s), int(26 * s)), pygame.SRCALPHA)
-        pygame.draw.ellipse(sh, (0, 0, 0, 120), sh.get_rect())
-        screen.blit(sh, (x - 48 * s, y - 8 * s))
+        # --- the figure is drawn at SS× into a scratch buffer and scaled down,
+        # which anti-aliases the whole silhouette at once: no stair-stepping on
+        # limbs, and no seams where capsules overlap.
+        pad = 30 * s
+        xs = [q[0] for q in J.values()]
+        ys = [q[1] for q in J.values()]
+        minx, miny = min(xs) - pad, min(ys) - pad
+        w = min(FIG_W, int(max(xs) + pad - minx) + 2)
+        h = min(FIG_H, int(max(ys) + pad - miny) + 2)
+        if w < 4 or h < 4:
+            return
+        buf = _fig_buf.subsurface(pygame.Rect(0, 0, w * SS, h * SS))
+        buf.fill((0, 0, 0, 0))
 
-        if not self.alive:                               # knocked out: lie down
-            limb((x - 46 * s, y - 12 * s), (x + 34 * s, y - 8 * s), int(16 * s), body)
-            pygame.draw.circle(screen, SKIN, ipt((x + 50 * s, y - 14 * s)), int(15 * s))
+        def T(q):
+            return ((q[0] - minx) * SS, (q[1] - miny) * SS)
+
+        u = s * SS                                  # design units -> buffer px
+        hip, neck, head = T(J["hip"]), T(J["neck"]), T(J["head"])
+
+        def leg(tag, col):
+            k_, f_ = T(J["knee_" + tag]), T(J["foot_" + tag])
+            taper(buf, hip, k_, 13.5 * u, 11 * u, col)
+            taper(buf, k_, f_, 11 * u, 8 * u, col)
+            pygame.draw.circle(buf, acc, (int(f_[0]), int(f_[1])), int(6.5 * u))
+
+        def arm(tag, col):
+            sh_, el, hd = T(J["sh_" + tag]), T(J["elbow_" + tag]), T(J["hand_" + tag])
+            taper(buf, sh_, el, 10.5 * u, 9 * u, col)
+            taper(buf, el, hd, 9 * u, 7 * u, col)
+            pygame.draw.circle(buf, acc, (int(hd[0]), int(hd[1])), int(7 * u))
+
+        leg("b", dark)
+        arm("b", dark)
+        taper(buf, hip, neck, 17 * u, 15 * u, body)                 # torso
+        pygame.draw.circle(buf, acc, (int(hip[0]), int(hip[1])), int(8 * u))   # belt
+        leg("f", lite)
+
+        hr = 15 * u
+        pygame.draw.circle(buf, SKIN, (int(head[0]), int(head[1])), int(hr))
+        cap = pygame.Rect(0, 0, int(hr * 2), int(hr))                # hair
+        cap.center = (int(head[0] - fc * 1.5 * u), int(head[1] - hr * 0.46))
+        pygame.draw.ellipse(buf, dark, cap)
+        pygame.draw.circle(buf, BLACK,
+                           (int(head[0] + fc * 6 * u), int(head[1] + 2 * u)),
+                           max(1, int(2.2 * u)))
+        arm("f", lite)
+
+        screen.blit(pygame.transform.smoothscale(buf, (w, h)), (minx, miny))
+
+        if CFG.debug.skeleton:
+            for name, q in J.items():
+                pygame.draw.circle(screen, CYAN, ipt(q), 3)
+            for foot in self.skel.feet:
+                pygame.draw.circle(screen, RED if foot[2] < 0.5 else GOLD,
+                                   ipt((foot[0], foot[1])), 5, 1)
+
+        if not self.alive:
             return
 
-        gait = math.sin(self.anim * 12)
-        bob = (abs(math.sin(self.anim * 12)) * 5 if walking else math.sin(self.anim * 2.4) * 2.5)
-        stun_wobble = math.sin(self.anim * 26) * 4 if self.stun > 0 else 0
+        # --- glows and status, in world space (additive, must not be scaled)
+        if self.atk > 0 and self.atype == "kick":
+            fx, fy = J["foot_f"]
+            if abs(fx - self.x) > 70 * s:
+                glow(fx, fy, int(19 * s), acc)
+        elif self.atk > 0 and self.atype in ("punch", "cast"):
+            hx, hy = J["hand_f"]
+            if abs(hx - self.x) > 55 * s:
+                glow(hx, hy, int(15 * s), acc)
 
-        # --- torso / head anchors
-        lean = 0.0
-        if punching:
-            lean = f * 9 * swing
-        elif kicking:
-            lean = -f * 12 * swing
-        elif casting:
-            lean = -f * 4 * swing
-        hip = (x, y - 74 * s)
-        neck = (x + lean + stun_wobble, y - (122 * s + bob))
-        head = (neck[0] + f * 4, neck[1] - 25 * s)
-        hr = int(15 * s)
-
-        def knee_of(a, b, push):
-            return ((a[0] + b[0]) / 2 + f * push * s, (a[1] + b[1]) / 2)
-
-        # --- legs
-        lw = int(12 * s)
-        if kicking:
-            # planted support leg, deeply bent; the body sits into it
-            plant = (x - f * 20 * s, y)
-            k_s = (x - f * 4 * s, y - 34 * s)
-            limb(hip, k_s, lw, dark); limb(k_s, plant, lw, dark)
-            pygame.draw.circle(screen, acc, ipt(plant), int(7 * s))
-            # roundhouse: chamber the knee, then snap the shin out
-            chamber = min(1.0, phase / 0.34)
-            ext = max(0.0, min(1.0, (phase - 0.26) / 0.34))
-            back = max(0.0, (phase - 0.62) / 0.38)
-            drive = max(0.0, ext - back)
-            foot = (x + f * (30 + 104 * drive) * s, y - (56 + 34 * chamber - 14 * drive) * s)
-            knee = (x + f * (26 + 34 * chamber) * s, y - (52 + 18 * chamber) * s)
-            limb(hip, knee, lw, lite); limb(knee, foot, int(11 * s), lite)
-            pygame.draw.circle(screen, acc, ipt(foot), int(9 * s))
-            if drive > 0.45:
-                glow(foot[0], foot[1], int(30 * s), acc)
-        elif walking:
-            for sign, col in ((-1, dark), (1, lite)):
-                ph = gait * sign
-                lift = max(0.0, ph) * 15 * s
-                foot = (x + f * ph * 27 * s, y - lift)
-                knee = knee_of(hip, foot, 8 + ph * 8)
-                limb(hip, knee, lw, col); limb(knee, foot, lw, col)
-                pygame.draw.circle(screen, acc, ipt(foot), int(6 * s))
-        else:
-            stance = 1.12 if punching else 1.0
-            for sign, col in ((-1, dark), (1, lite)):
-                foot = (x + f * sign * 20 * s * stance, y)
-                knee = knee_of(hip, foot, 9 + (4 if sign > 0 else 0))
-                limb(hip, knee, lw, col); limb(knee, foot, lw, col)
-                pygame.draw.circle(screen, acc, ipt(foot), int(6 * s))
-
-        # --- torso + belt
-        limb(hip, neck, int(17 * s), body)
-        pygame.draw.circle(screen, acc, ipt((hip[0], hip[1] - 2 * s)), int(8 * s))
-
-        # --- arms
-        sh_f = (neck[0] + f * 11 * s, neck[1] + 6 * s)
-        sh_b = (neck[0] - f * 11 * s, neck[1] + 8 * s)
-        aw = int(10 * s)
-
-        def arm(shoulder, hand, push, col):
-            elbow = ((shoulder[0] + hand[0]) / 2 + f * push * s,
-                     (shoulder[1] + hand[1]) / 2 + 10 * s)
-            limb(shoulder, elbow, aw, col); limb(elbow, hand, int(9 * s), col)
-            pygame.draw.circle(screen, acc, ipt(hand), int(7 * s))
-            return hand
-
-        if punching:
-            reach = (30 + 78 * swing) * s
-            lead = (x + f * reach, neck[1] + 2 * s)
-            guard = (neck[0] - f * 2 * s, neck[1] - 14 * s)
-            arm(sh_b, guard, -6, dark)
-            arm(sh_f, lead, 2, lite)
-            if swing > 0.5:
-                glow(lead[0], lead[1], int(18 * s), acc)
-        elif casting:
-            up = (x + f * (28 + 30 * swing) * s, neck[1] - (28 + 28 * swing) * s)
-            low = (x + f * (20 + 16 * swing) * s, neck[1] + 6 * s)
-            arm(sh_b, low, -3, dark)
-            arm(sh_f, up, 5, lite)
-            glow(up[0], up[1], int((16 + 20 * swing) * s), acc)
-        elif kicking:
-            arm(sh_b, (neck[0] - f * 30 * s, neck[1] - 4 * s), -9, dark)
-            arm(sh_f, (neck[0] + f * 20 * s, neck[1] - 20 * s), 6, lite)
-        else:
-            g = math.sin(self.anim * 2.4) * 2 * s
-            arm(sh_b, (neck[0] + f * 3 * s, neck[1] - 16 * s + g), -8, dark)
-            arm(sh_f, (neck[0] + f * 21 * s, neck[1] - 8 * s - g), 7, lite)
-
-        # --- head
-        pygame.draw.circle(screen, SKIN, ipt(head), hr)
-        pygame.draw.circle(screen, shade(SKIN, 0.62), ipt(head), hr, max(1, int(2 * s)))
-        hair = pygame.Rect(0, 0, hr * 2, hr)                    # hair as a top cap
-        hair.center = (head[0] - f * 1.5 * s, head[1] - hr * 0.46)
-        pygame.draw.ellipse(screen, dark, hair)
-        pygame.draw.circle(screen, BLACK, ipt((head[0] + f * 6 * s, head[1] + 2 * s)),
-                           max(1, int(2.2 * s)))
-
-        # --- spirit orb drifting above the head
-        orb = (x + f * 2, y - (192 * s + bob + math.sin(self.anim * 2.2) * 4))
+        bob = math.sin(self.skel.breath) * 3
+        orb = (self.x + fc * 2, self.y - (196 * s + bob))
         glow(orb[0], orb[1], int(20 * s), acc)
         pygame.draw.circle(screen, acc, ipt(orb), int(8 * s))
-        pygame.draw.circle(screen, WHITE, ipt((orb[0] - 2.5 * s, orb[1] - 2.5 * s)), int(3 * s))
+        pygame.draw.circle(screen, WHITE, ipt((orb[0] - 2.5 * s, orb[1] - 2.5 * s)),
+                           int(3 * s))
 
-        # --- status rings
         if self.shield > 0:
             r = int(64 * s)
             a = int(58 + 40 * math.sin(self.anim * 7))
             srf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
             pygame.draw.circle(srf, (acc[0], acc[1], acc[2], a), (r, r), r, 3)
             pygame.draw.circle(srf, (acc[0], acc[1], acc[2], 14), (r, r), r - 4)
-            screen.blit(srf, (x - r, y - 92 * s - r))
+            screen.blit(srf, (self.x - r, self.y - 92 * s - r))
         if self.stun > 0:
+            hx, hy = J["head"]
             for j in range(3):
                 a = self.anim * 7 + j * math.tau / 3
                 pygame.draw.circle(screen, GOLD,
-                                   ipt((head[0] + math.cos(a) * 26 * s,
-                                        head[1] - 22 * s + math.sin(a) * 8 * s)), int(4 * s))
+                                   ipt((hx + math.cos(a) * 26 * s,
+                                        hy - 22 * s + math.sin(a) * 8 * s)), int(4 * s))
         if self.root > 0:
-            pygame.draw.ellipse(screen, GOLD, (x - 34 * s, y - 12 * s, 68 * s, 24 * s), 3)
+            pygame.draw.ellipse(screen, GOLD,
+                                (self.x - 34 * s, self.y - 12 * s, 68 * s, 24 * s), 3)
 
-        # --- floating nameplate + mini health bar
         bw = 104
-        bx, by = x - bw / 2, y - 224 * s
+        bx, by = self.x - bw / 2, self.y - 226 * s
         pygame.draw.rect(screen, (8, 10, 15), (bx - 2, by - 2, bw + 4, 11), border_radius=3)
         frac = self.hp / self.maxhp
         pygame.draw.rect(screen, GREEN if frac > 0.4 else RED,
                          (bx, by, int(bw * frac), 7), border_radius=3)
-        txt(self.n, (x, by - 14), SM, acc, True)
+        txt(self.n, (self.x, by - 14), SM, acc, True)
 
 
 # --------------------------------------------------------------------------
@@ -1520,6 +1890,8 @@ def frame(events, dt, t):
             running = False
         elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_F3:
             CFG.debug.overlay = not CFG.debug.overlay      # works in every state
+        elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_F4:
+            CFG.debug.skeleton = not CFG.debug.skeleton
         elif ev.type == pygame.KEYDOWN:
             if state == "menu":
                 if ev.key in (pygame.K_RIGHT, pygame.K_d):
@@ -1725,6 +2097,9 @@ def selftest():
     def key(k):
         return pygame.event.Event(pygame.KEYDOWN, {"key": k, "unicode": "", "mod": 0})
 
+    # start from a known loadout: a previous run that crashed mid-way can leave
+    # items in the save file, and toggling those would turn them *off*
+    equipped.clear()
     state = "menu"
     for _ in range(len(names) + 2):
         frame([key(pygame.K_d)], 1 / 60, 1.0)
@@ -1748,7 +2123,11 @@ def selftest():
     print(f"• match start: {p.n} vs {e.n}, loadout applied ({p.maxhp} hp, x{p.dmg_mult:.2f} dmg)")
 
     fired = 0
-    for i in range(2600):
+    # must exceed the full round (round_time * 60) so a stalemate — e.g. a
+    # self-healing Healer against a headless player that cannot press movement
+    # keys — still reaches the timeout decision rather than failing the assert
+    budget = int(CFG.game.round_time * 60) + 800
+    for i in range(budget):
         evs = []
         if i % 17 == 0:
             evs.append(key(random.choice([pygame.K_j, pygame.K_k])))
