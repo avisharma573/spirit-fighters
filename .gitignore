@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+spirit_fighters_save.json
+.venv/
+venv/
