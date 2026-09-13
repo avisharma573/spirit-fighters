@@ -36,11 +36,32 @@ except Exception:
 pygame.init()
 
 W, H = 1280, 720
+
+# The world is rendered larger than the window so the camera has somewhere to
+# move; the camera blits a sub-rect of it down to the 1280x720 display. Arena
+# geometry is authored in 1280x720 design units and scaled by KS.
+WW, WH = 1600, 900
+KS = WW / 1280.0
+
+
+def ks(v):
+    """Design-space (1280x720) value -> world-space value."""
+    return v * KS
+
 display = pygame.display.set_mode((W, H))
 pygame.display.set_caption("Spirit Fighters — Neon Citadel Stadium")
 # Everything is drawn to this offscreen buffer so the whole frame can be
 # shaken on impact before it reaches the window.
-screen = pygame.Surface((W, H)).convert()
+UI = pygame.Surface((W, H)).convert()            # 1280x720 — HUD, menus, overlays
+WORLD = pygame.Surface((WW, WH)).convert()       # 1600x900 — the arena and fighters
+# `screen` is whichever of the two is currently being drawn into. Every drawing
+# helper resolves it as a global at call time, so swapping it retargets them all.
+screen = UI
+
+
+def target(surf):
+    global screen
+    screen = surf
 clock = pygame.time.Clock()
 
 F = pygame.font.SysFont("arial", 20, 1)
@@ -95,12 +116,13 @@ CFG = Cfg(
     motion=Cfg(                 # PHASE B — skeleton, IK, procedural locomotion
         substep=1 / 120.0,      # springs integrate at a fixed rate, always
         max_substeps=6,
-        thigh=40, shin=40,      # bone lengths in design units (scaled by depth)
+        thigh=47, shin=47,      # bone lengths in design units (scaled by depth)
+        max_extend=0.80,        # force a step before the leg locks straight
         upper_arm=27, forearm=25,
         hip_h=74, chest_h=120, head_h=150,   # rest heights above the feet
         shoulder_w=11, stance_width=19,
         stride=52,              # distance between footfalls
-        gap_trigger=0.42,       # step when hips outrun the planted foot by this
+        gap_trigger=0.32,       # step when hips outrun the planted foot by this
         plant_ahead=0.52,       # how far ahead of the hips the foot lands
         swing_time=0.17,        # seconds a foot spends in the air
         step_lift=17,           # how high the swing foot arcs
@@ -115,6 +137,33 @@ CFG = Cfg(
         ragdoll_gravity=2300.0,
         ragdoll_damping=0.985,
         limb_taper=0.62,        # extremity width as a fraction of the root width
+    ),
+    feel=Cfg(                   # PHASE C — response and weight
+        sim_hz=120.0,           # fixed simulation rate; render interpolates off it
+        max_sim_steps=5,
+        accel=2600.0,           # ground acceleration toward the input direction
+        friction=11.0,          # exponential decay when there is no input
+        turn_boost=1.7,         # extra accel when reversing, so turns stay crisp
+        attack_buffer=0.13,     # an attack pressed this early still comes out
+        trauma_decay=1.9,       # trauma falls off per second; shake = trauma^2
+        trauma_max=1.0,
+        shake_pixels=34.0,      # world-space shake at full trauma
+        shake_zoom=0.045,       # camera punches in slightly on impact
+    ),
+    camera=Cfg(                 # PHASE C — dynamic follow + zoom
+        # all distances below are WORLD units (the world is 1600x900)
+        view_min=1120.0,        # view width when the fighters are close in
+        view_max=1580.0,        # ... and when they are far apart
+        # solved so a 150-unit clinch frames at view_min and a 900-unit
+        # split frames at view_max — the range fights actually occupy
+        sep_gain=0.61,          # how strongly separation opens the framing
+        margin=1030.0,          # baseline framing width
+        deadzone_x=55.0,        # camera ignores movement inside this box
+        deadzone_y=32.0,
+        lookahead=0.16,         # lead the camera along the fighters' velocity
+        follow=6.5,             # position spring rate
+        zoom_follow=3.4,        # framing spring rate (slower = calmer)
+        bias_y=-78.0,           # lift the framing so the stands stay in shot
     ),
     debug=Cfg(
         overlay=False,          # F3 toggles the frame-time readout
@@ -298,7 +347,7 @@ particles = []; shots = []; zones = []; floaters = []
 state = "menu"; pick = 0; p = e = None; result = ""
 timer = CFG.game.round_time; intro = 0.0; ko_timer = 0.0
 shop_sel = 0
-shake = 0.0; flash = 0.0
+shake = 0.0; flash = 0.0; sim_acc = 0.0
 banner = ""; banner_t = 0.0
 
 
@@ -405,8 +454,10 @@ def smoke(x, y, c, n=8, power=60):
 
 
 def add_shake(v):
+    """Impacts add *trauma*, not shake. Shake is trauma squared, so small hits
+    barely register and big ones hit hard — and it always decays to nothing."""
     global shake
-    shake = min(26.0, shake + v)
+    shake = min(CFG.feel.trauma_max, shake + v * 0.055)
 
 
 def add_flash(v):
@@ -426,102 +477,109 @@ def say(text, secs=1.1):
 # --------------------------------------------------------------------------
 # the stadium — baked once so nothing flickers and the frame stays cheap
 # --------------------------------------------------------------------------
-PITCH = pygame.Rect(20, 195, W - 40, 470)      # ground ellipse
+PITCH = pygame.Rect(int(ks(20)), int(ks(195)), int(ks(1280 - 40)), int(ks(470)))
 # derived from CFG so the hot paths below read cleanly; edit CFG.arena, not these
-GROUND_TOP, GROUND_BOTTOM = CFG.arena.ground_top, CFG.arena.ground_bottom
-MARGIN_X = CFG.arena.margin_x
+GROUND_TOP = ks(CFG.arena.ground_top)
+GROUND_BOTTOM = ks(CFG.arena.ground_bottom)
+MARGIN_X = ks(CFG.arena.margin_x)
 
 
 def build_arena():
-    bg = pygame.Surface((W, H)).convert()
+    """Bake the stadium once, authored in 1280x720 design units via ks()."""
+    bg = pygame.Surface((WW, WH)).convert()
     rng = random.Random(20240913)
 
     # night sky above the bowl
-    for y in range(0, 240):
-        t = y / 240
-        pygame.draw.line(bg, (int(6 + t * 8), int(9 + t * 13), int(18 + t * 22)), (0, y), (W, y))
-    for _ in range(90):                                    # stars through the open roof
-        sx, sy = rng.randint(0, W), rng.randint(0, 80)
+    horizon = int(ks(240))
+    for y in range(0, horizon):
+        t = y / horizon
+        pygame.draw.line(bg, (int(6 + t * 8), int(9 + t * 13), int(18 + t * 22)),
+                         (0, y), (WW, y))
+    for _ in range(110):                                   # stars through the roof
+        sx, sy = rng.randint(0, WW), rng.randint(0, int(ks(80)))
         v = rng.randint(60, 130)
         pygame.draw.circle(bg, (v, v, v + 20), (sx, sy), 1)
 
     # roof trusses
-    for x in range(-140, W + 160, 105):
-        pygame.draw.line(bg, (36, 45, 60), (x, 40), (x + 120, 150), 3)
-        pygame.draw.line(bg, (26, 33, 45), (x + 120, 150), (x + 120, 190), 2)
-    pygame.draw.rect(bg, (17, 22, 33), (0, 150, W, 44))
+    for x in range(int(-ks(140)), int(WW + ks(160)), int(ks(105))):
+        pygame.draw.line(bg, (36, 45, 60), (x, ks(40)), (x + ks(120), ks(150)), 3)
+        pygame.draw.line(bg, (26, 33, 45), (x + ks(120), ks(150)), (x + ks(120), ks(190)), 2)
+    pygame.draw.rect(bg, (17, 22, 33), (0, ks(150), WW, ks(44)))
 
-    # crowd — three tiers, each darker with distance, a few team-colour blocks
+    # crowd — three tiers, each darker with distance
     tiers = [(196, 3, (26, 32, 44)), (154, 3, (20, 25, 36)), (118, 2, (15, 19, 28))]
-    for base_y, rows, seat in tiers:
-        pygame.draw.rect(bg, seat, (0, base_y - rows * 13 - 4, W, rows * 13 + 8))
+    seat = int(ks(5)) + 1
+    for base_y, rows, col_seat in tiers:
+        pygame.draw.rect(bg, col_seat,
+                         (0, ks(base_y) - ks(rows * 13 + 4), WW, ks(rows * 13 + 8)))
         for r in range(rows):
-            yy = base_y - r * 13
-            for x in range(-6, W + 10, 8):
+            yy = ks(base_y) - r * ks(13)
+            for x in range(int(-ks(6)), int(WW + ks(10)), int(ks(8))):
                 if rng.random() < 0.14:
                     continue
                 v = max(8, rng.randint(24, 52) - r * 5)
-                col = (v, v + 3, v + 11)
+                c = (v, v + 3, v + 11)
                 if rng.random() < 0.022:
-                    col = rng.choice([(104, 44, 44), (44, 74, 116), (118, 100, 46), (46, 104, 76)])
-                pygame.draw.rect(bg, col, (x, yy + rng.randint(-2, 1), 5, 5))
-    pygame.draw.rect(bg, (9, 12, 19), (0, 200, W, 16))     # shadow under the stands
+                    c = rng.choice([(104, 44, 44), (44, 74, 116),
+                                    (118, 100, 46), (46, 104, 76)])
+                pygame.draw.rect(bg, c, (x, yy + rng.randint(-2, 1), seat, seat))
+    pygame.draw.rect(bg, (9, 12, 19), (0, ks(200), WW, ks(16)))   # shadow under stands
 
     # the pitch: concentric bands read as mown rings under stadium light
-    for k in range(9):
-        f = 1 - k * 0.105
-        tone = 1.0 + (0.16 if k % 2 else 0.0)
-        col = shade((17, 40, 33), tone + (8 - k) * 0.02)
+    for j in range(9):
+        f = 1 - j * 0.105
+        tone = 1.0 + (0.16 if j % 2 else 0.0)
+        col = shade((17, 40, 33), tone + (8 - j) * 0.02)
         rect = pygame.Rect(0, 0, int(PITCH.w * f), int(PITCH.h * f))
         rect.center = (PITCH.centerx, PITCH.centery)
         pygame.draw.ellipse(bg, col, rect)
 
     # markings
     line = (74, 122, 140)
-    pygame.draw.ellipse(bg, line, PITCH, 4)
-    inner = PITCH.inflate(-150, -110)
-    pygame.draw.ellipse(bg, shade(line, 0.6), inner, 2)
-    pygame.draw.circle(bg, line, (W // 2, PITCH.centery), 118, 2)
-    pygame.draw.circle(bg, line, (W // 2, PITCH.centery), 40, 2)
-    pygame.draw.circle(bg, shade(line, 0.8), (W // 2, PITCH.centery), 5)
-    pygame.draw.line(bg, line, (W // 2, PITCH.top + 16), (W // 2, PITCH.bottom - 16), 2)
+    pygame.draw.ellipse(bg, line, PITCH, int(ks(4)))
+    pygame.draw.ellipse(bg, shade(line, 0.6), PITCH.inflate(-ks(150), -ks(110)), 2)
+    pygame.draw.circle(bg, line, (WW // 2, PITCH.centery), int(ks(118)), 2)
+    pygame.draw.circle(bg, line, (WW // 2, PITCH.centery), int(ks(40)), 2)
+    pygame.draw.circle(bg, shade(line, 0.8), (WW // 2, PITCH.centery), int(ks(5)))
+    pygame.draw.line(bg, line, (WW // 2, PITCH.top + ks(16)),
+                     (WW // 2, PITCH.bottom - ks(16)), 2)
 
-    # player tunnels at both ends — arched mouths cut into the lower stand,
-    # with a warm interior light, plus the hoardings that fence them off
-    for tx in (36, W - 116):
-        mouth = pygame.Rect(tx, 296, 80, 150)
-        pygame.draw.rect(bg, (7, 9, 14), mouth, border_radius=38)          # opening
-        for i in range(5):                                                 # depth falloff
-            inner = mouth.inflate(-10 - i * 9, -10 - i * 9)
-            inner.bottom = mouth.bottom - 4
+    # player tunnels at both ends, with barrier rails
+    for tx in (ks(36), WW - ks(116)):
+        mouth = pygame.Rect(int(tx), int(ks(296)), int(ks(80)), int(ks(150)))
+        rad = int(ks(38))
+        pygame.draw.rect(bg, (7, 9, 14), mouth, border_radius=rad)
+        for i in range(5):
+            inner = mouth.inflate(-ks(10 + i * 9), -ks(10 + i * 9))
+            inner.bottom = mouth.bottom - int(ks(4))
             v = 10 + i * 5
-            pygame.draw.rect(bg, (v + 6, v + 3, v), inner, border_radius=26)
-        pygame.draw.rect(bg, (44, 56, 72), mouth, 4, border_radius=38)     # frame
-        pygame.draw.rect(bg, (74, 92, 116), (tx + 6, 290, 68, 8), border_radius=3)
-        # barrier rail in front of the tunnel
-        for yy in (452, 466):
-            pygame.draw.line(bg, (52, 64, 82), (tx - 6, yy), (tx + 86, yy), 3)
-        for xx in range(tx - 4, tx + 88, 21):
-            pygame.draw.line(bg, (40, 50, 66), (xx, 448), (xx, 470), 3)
+            pygame.draw.rect(bg, (v + 6, v + 3, v), inner, border_radius=int(ks(26)))
+        pygame.draw.rect(bg, (44, 56, 72), mouth, int(ks(4)), border_radius=rad)
+        pygame.draw.rect(bg, (74, 92, 116),
+                         (tx + ks(6), ks(290), ks(68), ks(8)), border_radius=3)
+        for yy in (ks(452), ks(466)):
+            pygame.draw.line(bg, (52, 64, 82), (tx - ks(6), yy), (tx + ks(86), yy), int(ks(3)))
+        for xx in range(int(tx - ks(4)), int(tx + ks(88)), int(ks(21))):
+            pygame.draw.line(bg, (40, 50, 66), (xx, ks(448)), (xx, ks(470)), int(ks(3)))
 
-    # floodlight towers (the lamp glow itself is animated at runtime)
-    for x in (96, W - 108):
-        pygame.draw.rect(bg, (34, 42, 54), (x, 112, 14, 100), border_radius=4)
-        pygame.draw.rect(bg, (44, 54, 68), (x - 14, 96, 42, 20), border_radius=5)
+    # floodlight towers (the lamps themselves are animated at runtime)
+    for x in (ks(96), WW - ks(108)):
+        pygame.draw.rect(bg, (34, 42, 54), (x, ks(112), ks(14), ks(100)), border_radius=4)
+        pygame.draw.rect(bg, (44, 54, 68), (x - ks(14), ks(96), ks(42), ks(20)), border_radius=5)
 
-    # perimeter advertising boards
-    pygame.draw.rect(bg, (14, 20, 30), (0, 664, W, 10))
+    pygame.draw.rect(bg, (14, 20, 30), (0, ks(664), WW, ks(10)))   # perimeter boards
     return bg
 
 
 def build_vignette(depth=170, peak=140):
-    v = pygame.Surface((W, H), pygame.SRCALPHA)
+    v = pygame.Surface((WW, WH), pygame.SRCALPHA)
+    depth = int(ks(depth))
     for i in range(depth):
         c = (0, 0, 0, int(peak * (1 - i / depth) ** 2.1))
-        pygame.draw.line(v, c, (0, i), (W, i))
-        pygame.draw.line(v, c, (0, H - 1 - i), (W, H - 1 - i))
-        pygame.draw.line(v, c, (i, 0), (i, H))
-        pygame.draw.line(v, c, (W - 1 - i, 0), (W - 1 - i, H))
+        pygame.draw.line(v, c, (0, i), (WW, i))
+        pygame.draw.line(v, c, (0, WH - 1 - i), (WW, WH - 1 - i))
+        pygame.draw.line(v, c, (i, 0), (i, WH))
+        pygame.draw.line(v, c, (WW - 1 - i, 0), (WW - 1 - i, WH))
     return v
 
 
@@ -536,17 +594,17 @@ ARENA.blit(build_vignette(), (0, 0))
 def arena(t):
     screen.blit(ARENA, (0, 0))
     # floodlights breathe very slightly, like real arc lamps
-    for x in (103, W - 101):
+    for x in (ks(103), WW - ks(101)):
         b = 0.88 + 0.12 * math.sin(t * 1.7 + x)
         for j in range(3):
-            cx, cy = x - 8 + j * 8, 104
-            pygame.draw.circle(screen, shade((255, 246, 216), b), (cx, cy), 3)
-            glow(cx, cy, int(16 * b), (120, 118, 100))
+            cx, cy = x - ks(8) + j * ks(8), ks(104)
+            pygame.draw.circle(screen, shade((255, 246, 216), b), (int(cx), int(cy)), int(ks(3)))
+            glow(cx, cy, int(ks(16) * b), (120, 118, 100))
     # LED perimeter running colour along the boards
-    for i, x in enumerate(range(40, W - 40, 46)):
+    for i, x in enumerate(range(int(ks(40)), int(WW - ks(40)), int(ks(46)))):
         ph = (math.sin(t * 2.6 - i * 0.35) + 1) * 0.5
         c = (int(14 + 40 * ph), int(40 + 120 * ph), int(60 + 150 * ph))
-        pygame.draw.rect(screen, c, (x, 664, 30, 9), border_radius=3)
+        pygame.draw.rect(screen, c, (x, ks(664), ks(30), ks(9)), border_radius=3)
 
 
 # --------------------------------------------------------------------------
@@ -579,7 +637,7 @@ class Shot:
         self.homing = homing; self.size = size
         self.life = 1.7
         dx = target.x - self.x
-        dy = (target.y - 105) - self.y
+        dy = (target.y - ks(105)) - self.y
         q = math.hypot(dx, dy) or 1
         spread = random.uniform(-0.10, 0.10)
         ca, sa = math.cos(spread), math.sin(spread)
@@ -592,7 +650,7 @@ class Shot:
         if not self.t.alive:
             self.life = 0
             return
-        tx, ty = self.t.x, self.t.y - 100
+        tx, ty = self.t.x, self.t.y - ks(100)
         dx, dy = tx - self.x, ty - self.y
         q = math.hypot(dx, dy) or 1
         sp = math.hypot(self.vx, self.vy) or 1
@@ -603,7 +661,7 @@ class Shot:
         self.trail.append((self.x, self.y))
         if len(self.trail) > 7:
             self.trail.pop(0)
-        if q < 30:
+        if q < ks(30):
             self.t.hit(self.damage)
             if self.o.lifesteal:
                 self.o.heal(self.damage * self.o.lifesteal)
@@ -678,6 +736,74 @@ class Zone:
         self._ellipse(self.r + pulse, 3, shade(self.c, fade))
         self._ellipse(self.r * 0.62, 1, shade(self.c, fade * 0.7))
         glow(self.x, self.y, int(self.r * 1.1), shade(self.c, 0.09 * fade))
+
+
+# --------------------------------------------------------------------------
+# PHASE C — camera
+# --------------------------------------------------------------------------
+class Camera:
+    """Follows the midpoint of the fight, frames wider as the fighters separate,
+    leads their velocity, and ignores small movement inside a deadzone."""
+
+    def __init__(self):
+        self.x = WW * 0.5
+        self.y = GROUND_BOTTOM - 75
+        self.view = CFG.camera.view_max
+        self.shake_x = self.shake_y = 0.0
+        self.seed = random.random() * 100
+
+    def snap(self, a, b):
+        self.x, self.y, self.view = self._want(a, b)
+
+    def _want(self, a, b):
+        c = CFG.camera
+        mx = (a.x + b.x) * 0.5 + (a.vx + b.vx) * 0.5 * c.lookahead
+        my = (a.y + b.y) * 0.5 + c.bias_y
+        sep = abs(a.x - b.x) + abs(a.y - b.y) * 0.6
+        view = max(c.view_min, min(c.view_max, sep * c.sep_gain + c.margin))
+        return mx, my, view
+
+    def update(self, dt, a, b):
+        c = CFG.camera
+        wx, wy, wview = self._want(a, b)
+        # deadzone: the camera only chases once the target leaves the box
+        dx, dy = wx - self.x, wy - self.y
+        if abs(dx) > c.deadzone_x:
+            self.x += (dx - math.copysign(c.deadzone_x, dx)) * min(1, c.follow * dt)
+        if abs(dy) > c.deadzone_y:
+            self.y += (dy - math.copysign(c.deadzone_y, dy)) * min(1, c.follow * dt)
+        self.view += (wview - self.view) * min(1, c.zoom_follow * dt)
+
+        # trauma-driven shake, smooth rather than white noise
+        tr = shake * shake
+        t = pygame.time.get_ticks() / 1000.0
+        amp = tr * CFG.feel.shake_pixels
+        self.shake_x = (math.sin(t * 27.3 + self.seed) * 0.6 +
+                        math.sin(t * 11.7 + self.seed * 2) * 0.4) * amp
+        self.shake_y = (math.sin(t * 23.1 + self.seed * 3) * 0.6 +
+                        math.sin(t * 9.3 + self.seed * 4) * 0.4) * amp * 0.6
+
+    def view_rect(self):
+        vw = self.view * (1.0 - shake * shake * CFG.feel.shake_zoom)   # impact punch-in
+        vh = vw * H / W
+        x = self.x + self.shake_x - vw * 0.5
+        y = self.y + self.shake_y - vh * 0.5
+        x = max(0.0, min(WW - vw, x))
+        y = max(0.0, min(WH - vh, y))
+        return pygame.Rect(int(x), int(y), max(2, int(vw)), max(2, int(vh)))
+
+    def apply(self, src, dst):
+        r = self.view_rect()
+        r.width = min(r.width, src.get_width() - r.x)
+        r.height = min(r.height, src.get_height() - r.y)
+        pygame.transform.smoothscale(src.subsurface(r), (W, H), dst)
+
+    def to_screen(self, wx, wy):
+        r = self.view_rect()
+        return ((wx - r.x) * W / r.width, (wy - r.y) * H / r.height)
+
+
+cam = Camera()
 
 
 # --------------------------------------------------------------------------
@@ -797,6 +923,7 @@ class Skeleton:
                      [f.x + m.stance_width * s, f.y, 0.0]]
         self.stance = 0              # index of the planted foot
         self.swing_t = 1.0           # 1.0 = both feet down
+        self.swing_dur = CFG.motion.swing_time
         self.swing_from = (f.x, f.y)
         self.swing_to = (f.x, f.y)
         self.travel = 0.0
@@ -887,43 +1014,64 @@ class Skeleton:
             return
 
         if self.swing_t < 1.0:
-            self.swing_t = min(1.0, self.swing_t + dt / max(m.swing_time, 1e-4))
+            self.swing_t = min(1.0, self.swing_t + dt / max(self.swing_dur, 1e-4))
             sw = self.stance ^ 1
-            u = smoothstep(self.swing_t)
             foot = self.feet[sw]
+            # Re-aim in flight so an accelerating fighter still lands the foot
+            # underneath itself. Only while clearly airborne, so the planted
+            # endpoints of the arc are never nudged.
+            if speed > 12 and 0.15 < self.swing_t < 0.85:
+                dirx, diry = f.vx / speed, f.vy / speed
+                lat = (m.stance_width * s) * (1 if sw == 1 else -1)
+                self.swing_to = (f.x + dirx * m.stride * s * m.plant_ahead - diry * lat,
+                                 max(GROUND_TOP, min(GROUND_BOTTOM,
+                                     f.y + diry * m.stride * s * m.plant_ahead * 0.6
+                                     + dirx * lat * 0.4)))
+            u = smoothstep(self.swing_t)
             foot[0] = lerp(self.swing_from[0], self.swing_to[0], u)
             foot[1] = lerp(self.swing_from[1], self.swing_to[1], u)
             foot[2] = math.sin(self.swing_t * math.pi) * m.step_lift * s
             if self.swing_t >= 1.0:
                 foot[2] = 0.0
                 self.last_plant = (foot[0], foot[1])   # footfall event
-        else:
-            stride = m.stride * s
-            need_step = False
-            dirx, diry = 0.0, 0.0
-            stance_foot = self.feet[self.stance]
-            gap = math.hypot(f.x - stance_foot[0], (f.y - stance_foot[1]) * 1.6)
-            if speed > 12:
-                dirx, diry = f.vx / speed, f.vy / speed
-                # step once the hips have outrun the planted foot, so the leg
-                # can never stretch further than one stride
-                need_step = gap > stride * m.gap_trigger
-            elif gap > m.stance_width * s * 1.5:
-                need_step = True                       # drifted; re-centre
-                dirx = 1.0 if f.x > stance_foot[0] else -1.0
+            return
 
-            if need_step:
-                self.travel = 0.0
-                self.stance ^= 1
-                sw = self.stance ^ 1
-                perpx, perpy = -diry, dirx
-                lat = (m.stance_width * s) * (1 if sw == 1 else -1)
-                self.swing_from = (self.feet[sw][0], self.feet[sw][1])
-                self.swing_to = (f.x + dirx * stride * m.plant_ahead + perpx * lat,
-                                 max(GROUND_TOP, min(GROUND_BOTTOM,
-                                     f.y + diry * stride * m.plant_ahead * 0.6
-                                     + perpy * lat * 0.4)))
-                self.swing_t = 0.0
+        stride = m.stride * s
+        reach = (m.thigh + m.shin) * s
+        hip_y = f.y - m.hip_h * s
+        anchor = self.feet[self.stance]
+        leg_d = math.hypot(f.x - anchor[0], hip_y - anchor[1])
+
+        if speed > 12:
+            dirx, diry = f.vx / speed, f.vy / speed
+        else:
+            dirx = 1.0 if f.x >= (self.feet[0][0] + self.feet[1][0]) * 0.5 else -1.0
+            diry = 0.0
+
+        # Swing whichever foot is furthest BEHIND along the direction of travel
+        # and anchor the other. Self-correcting: the planted foot is always the
+        # forward one, so a stride can never be measured from a trailing foot.
+        d0 = (f.x - self.feet[0][0]) * dirx + (f.y - self.feet[0][1]) * diry
+        d1 = (f.x - self.feet[1][0]) * dirx + (f.y - self.feet[1][1]) * diry
+        sw = 0 if d0 >= d1 else 1
+        trailing = max(d0, d1)
+
+        need_step = (leg_d > reach * m.max_extend
+                     or (speed > 12 and trailing > stride * m.gap_trigger)
+                     or (speed <= 12 and trailing > m.stance_width * s * 1.6))
+
+        if need_step:
+            self.stance = sw ^ 1
+            self.swing_dur = max(0.070, min(m.swing_time,
+                                            stride / max(speed, 1.0) * 0.45))
+            lat = (m.stance_width * s) * (1 if sw == 1 else -1)
+            self.swing_from = (self.feet[sw][0], self.feet[sw][1])
+            self.swing_to = (f.x + dirx * stride * m.plant_ahead - diry * lat,
+                             max(GROUND_TOP, min(GROUND_BOTTOM,
+                                 f.y + diry * stride * m.plant_ahead * 0.6
+                                 + dirx * lat * 0.4)))
+            self.swing_t = 0.0
+            self.travel = 0.0
 
     # ---- pose -----------------------------------------------------------
     def joints(self):
@@ -959,6 +1107,17 @@ class Skeleton:
             lean -= fc * 6 * max(0.0, drive)
 
         hip = [f.x + shift * 0.5, f.y - m.hip_h * s + self.chest.v * 0.4]
+        # If a planted foot is further away than the leg can reach, sink the
+        # hips until it can. A real body dips into a lunge rather than letting
+        # the foot detach, and this makes non-detachment a guarantee, not a
+        # tuning hope.
+        reach_leg = (m.thigh + m.shin) * s * 0.985
+        for _fx, _fy, _lift in self.feet:
+            _dx = hip[0] - _fx
+            if abs(_dx) < reach_leg:
+                _lowest = _fy - math.sqrt(reach_leg * reach_leg - _dx * _dx)
+                if hip[1] < _lowest:
+                    hip[1] = _lowest
         neck = [f.x + lean * 0.55 + shift * 0.3,
                 f.y - m.chest_h * s - breath * 0.35 + self.chest.v]
         head = [neck[0] + fc * 4 * s + self.head.v * 0.5,
@@ -1046,7 +1205,9 @@ class Fighter:
         self.combo = 0; self.combo_t = 0.0
         self.hitstop = 0.0; self.flinch = 0.0
         self.moving = False; self.px = self.x; self.py = self.y
-        self.vx = 0.0; self.vy = 0.0                     # px/s, drives lean + stride
+        self.vx = 0.0; self.vy = 0.0                     # measured, drives lean + stride
+        self.mvx = 0.0; self.mvy = 0.0                   # locomotion velocity
+        self.buffer = None; self.buffer_t = 0.0          # queued attack input
         self.kx = 0.0                                    # knockback velocity
         self.skel = Skeleton(self)
         # modifiers (the shop writes these)
@@ -1056,8 +1217,8 @@ class Fighter:
     # ---- geometry -------------------------------------------------------
     def scale(self):
         """Fighters further up the pitch stand smaller — cheap real depth."""
-        return CFG.arena.scale_near + ((self.y - GROUND_TOP) /
-                (GROUND_BOTTOM - GROUND_TOP)) * CFG.arena.scale_range
+        return (CFG.arena.scale_near + ((self.y - GROUND_TOP) /
+                (GROUND_BOTTOM - GROUND_TOP)) * CFG.arena.scale_range) * KS
 
     # ---- damage ---------------------------------------------------------
     def hit(self, damage):
@@ -1109,22 +1270,51 @@ class Fighter:
 
     # ---- movement -------------------------------------------------------
     def move(self, dx, dy, dt):
+        """Input steers an acceleration, not a position.
+
+        Reaching top speed takes a moment and stopping takes a moment, which is
+        most of what makes the fighter feel like it has mass.
+        """
         if self.stun > 0 or self.root > 0 or not self.alive:
-            return
+            dx = dy = 0
+        fe = CFG.feel
+        top = self.speed * KS * (1.38 if self.buff > 0 else 1.0)
+        if self.atk > 0:
+            top *= 0.55                        # committed to a strike, not frozen
         q = math.hypot(dx, dy)
         if q:
-            sp = self.speed * (1.38 if self.buff > 0 else 1.0)
-            if self.atk > 0:
-                sp *= 0.55                     # committed to a strike, but not frozen
-            self.x += dx / q * sp * dt
-            self.y += dy / q * sp * dt * CFG.arena.depth_squash  # seen at an angle
-            if abs(dx) > 0 and self.atk <= 0:
+            ux, uy = dx / q, dy / q
+            acc = fe.accel * KS
+            if ux * self.mvx < 0:              # reversing: bite harder
+                acc *= fe.turn_boost
+            self.mvx += ux * acc * dt
+            self.mvy += uy * acc * dt * CFG.arena.depth_squash
+            if self.atk <= 0 and abs(dx) > 0:
                 self.facing = 1 if dx > 0 else -1
+        else:
+            damp = max(0.0, 1.0 - fe.friction * dt)
+            self.mvx *= damp
+            self.mvy *= damp
+
+        sp = math.hypot(self.mvx, self.mvy / max(CFG.arena.depth_squash, 1e-3))
+        if sp > top:                           # clamp to the spirit's top speed
+            f = top / sp
+            self.mvx *= f
+            self.mvy *= f
+        self.x += self.mvx * dt
+        self.y += self.mvy * dt
         self.clamp()
 
     def clamp(self):
-        self.x = max(MARGIN_X, min(W - MARGIN_X, self.x))
-        self.y = max(GROUND_TOP, min(GROUND_BOTTOM, self.y))
+        lo, hi = MARGIN_X, WW - MARGIN_X
+        if self.x < lo:
+            self.x = lo; self.mvx = max(0.0, self.mvx)
+        elif self.x > hi:
+            self.x = hi; self.mvx = min(0.0, self.mvx)
+        if self.y < GROUND_TOP:
+            self.y = GROUND_TOP; self.mvy = max(0.0, self.mvy)
+        elif self.y > GROUND_BOTTOM:
+            self.y = GROUND_BOTTOM; self.mvy = min(0.0, self.mvy)
 
     # ---- attacking ------------------------------------------------------
     def begin_attack(self, kind="punch"):
@@ -1141,6 +1331,10 @@ class Fighter:
     def attack(self, t, kind="punch"):
         if self.begin_attack(kind):
             self.resolve_basic(t)
+        elif self.alive and self.stun <= 0:
+            # too early — remember it and fire the moment recovery ends
+            self.buffer = kind
+            self.buffer_t = CFG.feel.attack_buffer
 
     def resolve_basic(self, t):
         """Hit detection runs every frame of the strike against the
@@ -1153,8 +1347,8 @@ class Fighter:
         dx = t.x - self.x
         dy = t.y - self.y
         front = dx * self.facing
-        reach = (96 if self.atype == "punch" else 124) * self.scale()
-        if -22 < front < reach and abs(dy) < 46:
+        reach = ks(96 if self.atype == "punch" else 124) * self.scale() / KS
+        if -ks(22) < front < reach and abs(dy) < ks(46):
             self.attack_landed = True
             base = 13 if self.atype == "punch" else 18
             if self.combo_t > 0:
@@ -1188,7 +1382,7 @@ class Fighter:
         sfx("cast", 0.6)
 
         if k == "melee":
-            if dist(self, t) < 140 * self.scale():
+            if dist(self, t) < ks(140) * self.scale() / KS:
                 self.deal(t, damage, True)
                 t.knock(self.facing, 20)
                 self.attack_landed = True
@@ -1203,9 +1397,9 @@ class Fighter:
                                   speed=(640 + j * 60) * self.proj, homing=1.4))
             sfx("shot", 0.7)
         elif k == "dash":
-            self.dash(t, d, 190)
+            self.dash(t, d, ks(190))
         elif k == "spin":
-            if dist(self, t) < 170 * self.scale():
+            if dist(self, t) < ks(170) * self.scale() / KS:
                 self.deal(t, damage, True)
                 t.knock(1 if t.x > self.x else -1, 24)
             for a in range(18):
@@ -1214,17 +1408,17 @@ class Fighter:
                                   math.cos(ang) * 140, math.sin(ang) * 60, 0.4, 0.4, self.b, 5, 0])
             add_shake(4)
         elif k == "area":
-            zones.append(Zone(t.x, t.y, 120, self.b, 2.6, d, t))
+            zones.append(Zone(t.x, t.y, ks(120), self.b, 2.6, d, t))
         elif k == "shield":
             self.shield = 4.5
             burst(self.x, self.y - 80, self.b, 20, 120, 5, grav=-150)
         elif k == "stun":
-            if dist(self, t) < 330:
+            if dist(self, t) < ks(330):
                 shots.append(Shot(self, t, d, CYAN, speed=1100 * self.proj, homing=6, size=5))
                 t.stun = 1.0
                 floaters.append(FloatingText(t.x, t.y - 150, "STUNNED", CYAN, S))
         elif k in ("root", "arrest"):
-            if dist(self, t) < 210:
+            if dist(self, t) < ks(210):
                 self.deal(t, damage, True)
                 t.root = 1.7
                 floaters.append(FloatingText(t.x, t.y - 150, "ROOTED", GOLD, S))
@@ -1235,12 +1429,12 @@ class Fighter:
         elif k == "heal":
             self.heal(damage)
         elif k == "hzone":
-            zones.append(Zone(self.x, self.y, 110, GREEN, 3.0, damage, self, True, warn=0.0))
+            zones.append(Zone(self.x, self.y, ks(110), GREEN, 3.0, damage, self, True, warn=0.0))
         elif k == "regen":
             self.buff = 5.0
             self.heal(damage)
         elif k == "life":
-            if dist(self, t) < 160 * self.scale():
+            if dist(self, t) < ks(160) * self.scale() / KS:
                 got = self.deal(t, damage, True)
                 self.heal(got * 0.6)
                 for a in range(12):
@@ -1268,7 +1462,8 @@ class Fighter:
             particles.append([ox + (self.x - ox) * f, oy - 80 + random.uniform(-22, 22),
                               -self.facing * 60, random.uniform(-30, 30),
                               0.35, 0.35, self.b, 6, 40])
-        if abs(t.x - self.x) < 130 and abs(t.y - self.y) < 60:
+        self.skel.snap_feet()
+        if abs(t.x - self.x) < ks(130) and abs(t.y - self.y) < ks(60):
             t.hit(damage)
             t.knock(self.facing, 22)
             add_shake(6)
@@ -1298,13 +1493,13 @@ class Fighter:
             t.knock(self.facing, 26)
         elif name == "Rain of Arrows":
             for j in range(7):
-                zones.append(Zone(t.x + random.uniform(-130, 130),
-                                  t.y + random.uniform(-50, 50),
-                                  62, self.b, 2.4, d, t, warn=0.3 + j * 0.14))
+                zones.append(Zone(t.x + random.uniform(-ks(130), ks(130)),
+                                  t.y + random.uniform(-ks(50), ks(50)),
+                                  ks(62), self.b, 2.4, d, t, warn=0.3 + j * 0.14))
         elif name in ("SWAT Raid", "Divine Judgment"):
             self.deal(t, damage, True)
             t.stun = 2.0
-            zones.append(Zone(t.x, t.y, 140, self.b, 1.6, d * 0.25, t, warn=0.35))
+            zones.append(Zone(t.x, t.y, ks(140), self.b, 1.6, d * 0.25, t, warn=0.35))
         elif name == "Demon Rage":
             self.deal(t, damage, True)
             self.heal(35)
@@ -1312,14 +1507,14 @@ class Fighter:
             t.knock(self.facing, 24)
         elif name == "Sonic Speed":
             for _ in range(3):
-                self.dash(t, damage / 3.0, 150)
+                self.dash(t, damage / 3.0, ks(150))
             self.buff = 5
         elif name == "Inferno":
-            zones.append(Zone(t.x, t.y, 165, self.b, 4.0, d, t, warn=0.4))
+            zones.append(Zone(t.x, t.y, ks(165), self.b, 4.0, d, t, warn=0.4))
         elif name == "Earth Titan":
             self.shield = 6.0
-            zones.append(Zone(self.x, self.y, 260, self.b, 0.9, d * 0.3, t, warn=0.3))
-            if dist(self, t) < 300:
+            zones.append(Zone(self.x, self.y, ks(260), self.b, 0.9, d * 0.3, t, warn=0.3))
+            if dist(self, t) < ks(300):
                 self.deal(t, damage, True)
                 t.knock(self.facing, 30)
 
@@ -1343,6 +1538,16 @@ class Fighter:
         self.moving = moved > 0.4
         self.px, self.py = self.x, self.y
         self.skel.update(dt)
+
+        if self.buffer_t > 0:
+            self.buffer_t -= dt
+            if self.atk <= 0 and self.stun <= 0:
+                kind, self.buffer, self.buffer_t = self.buffer, None, 0.0
+                other = e if self.player else p
+                if other is not None:
+                    self.attack(other, kind)
+            elif self.buffer_t <= 0:
+                self.buffer = None
 
         self.hitstop = max(0.0, self.hitstop - dt)
         self.flinch = max(0.0, self.flinch - dt)
@@ -1737,10 +1942,8 @@ def shop(t):
         (W // 2, 684), F, GOLD, True)
 
 
-def result_screen(t):
-    arena(t)
-    for fighter in sorted((p, e), key=lambda z: z.y):
-        fighter.draw()
+def result_overlay():
+    """Drawn onto the UI over the camera's view of the arena."""
     ov = pygame.Surface((W, H), pygame.SRCALPHA)
     ov.fill((0, 0, 0, 185))
     screen.blit(ov, (0, 0))
@@ -1776,16 +1979,18 @@ def apply_loadout(fighter):
 
 
 def start():
-    global p, e, state, timer, particles, shots, zones, floaters, result, intro, ko_timer
-    p = Fighter(names[pick], 380, 505, 1)
+    global p, e, state, timer, particles, shots, zones, floaters, result, intro, ko_timer, sim_acc
+    p = Fighter(names[pick], ks(380), ks(505), 1)
     apply_loadout(p)
-    e = Fighter(random.choice([n for n in names if n != p.n]), 900, 505, 0)
+    e = Fighter(random.choice([n for n in names if n != p.n]), ks(900), ks(505), 0)
     state = "fight"
+    sim_acc = 0.0
     timer = CFG.game.round_time
     intro = CFG.game.intro_time
     ko_timer = 0.0
     particles = []; shots = []; zones = []; floaters = []
     result = ""
+    cam.snap(p, e)
     say("FIGHT!", 1.1)
     sfx("ui")
 
@@ -1798,21 +2003,21 @@ def ai(dt):
     dx, dy = p.x - e.x, p.y - e.y
     q = math.hypot(dx, dy) or 1
     ranged = e.n in ("Archer", "Police", "Healer")
-    desired = 240 if ranged else 105
+    desired = ks(240) if ranged else ks(105)
     low = e.hp / e.maxhp < 0.3
 
     if low and random.random() < 0.5:
-        desired += 120
-    if q > desired + 30:
+        desired += ks(120)
+    if q > desired + ks(30):
         e.move(dx, dy, dt)
-    elif q < desired - 30:
+    elif q < desired - ks(30):
         e.move(-dx, -dy * 0.6, dt)
     else:
-        e.move(0, math.sin(pygame.time.get_ticks() / 700) * 40, dt)
+        e.move(0, math.sin(pygame.time.get_ticks() / 700) * 0.6, dt)
     if abs(dx) > 2:
         e.facing = 1 if dx > 0 else -1
 
-    if q < 140 and random.random() < dt * 1.5:
+    if q < ks(140) and random.random() < dt * 1.5:
         e.attack(p, "punch" if random.random() < 0.62 else "kick")
     for i in range(4):
         if e.cd[i] <= 0 and random.random() < dt * 0.45:
@@ -1882,7 +2087,7 @@ def draw_world(t):
 # main frame
 # --------------------------------------------------------------------------
 def frame(events, dt, t):
-    global state, pick, shop_sel, timer, intro, ko_timer, shake, flash, banner_t
+    global state, pick, shop_sel, timer, intro, ko_timer, shake, flash, banner_t, sim_acc
 
     running = True
     for ev in events:
@@ -1954,58 +2159,89 @@ def frame(events, dt, t):
                 p.attack(e, "kick")
 
     banner_t = max(0.0, banner_t - dt)
-    shake = max(0.0, shake - dt * 60)
+    shake = max(0.0, shake - dt * CFG.feel.trauma_decay)
     flash = max(0.0, flash - dt * 320)
 
-    if state == "fight":
-        intro = max(0.0, intro - dt)
-        k = pygame.key.get_pressed()
+    if state in ("fight", "ko"):
+        # Fixed simulation rate: springs, IK and the ragdoll all behave the same
+        # regardless of how fast the machine renders. The renderer then draws
+        # whatever the last completed step produced.
+        global sim_acc
+        if state == "fight":
+            intro = max(0.0, intro - dt)
+            kk = pygame.key.get_pressed()
+            ix = kk[pygame.K_d] - kk[pygame.K_a]
+            iy = kk[pygame.K_s] - kk[pygame.K_w]
+        else:
+            ix = iy = 0
         scale = CFG.game.hitstop_timescale if (p.hitstop > 0 or e.hitstop > 0) else 1.0
-        sdt = dt * scale
-        p.move(k[pygame.K_d] - k[pygame.K_a], k[pygame.K_s] - k[pygame.K_w], sdt)
-        p.up(sdt); e.up(sdt)
-        if intro <= 0:
-            ai(sdt)
-            timer = max(0.0, timer - dt)
-        update_world(sdt)
-        if not p.alive or not e.alive or timer <= 0:
-            state = "ko"
-            ko_timer = CFG.game.ko_time
-            say("K.O." if (not p.alive or not e.alive) else "TIME UP", 1.5)
-            add_shake(10)
-    elif state == "ko":
-        sdt = dt * CFG.game.ko_timescale              # brief slow-motion finish
-        p.up(sdt); e.up(sdt)
-        update_world(sdt)
-        ko_timer -= dt
-        if ko_timer <= 0:
-            finish()
+        if state == "ko":
+            scale = CFG.game.ko_timescale
+        sim_acc += dt * scale
+        step = 1.0 / CFG.feel.sim_hz
+        n = 0
+        while sim_acc >= step and n < CFG.feel.max_sim_steps:
+            p.move(ix, iy, step)
+            p.up(step)
+            e.up(step)
+            if state == "fight" and intro <= 0:
+                ai(step)
+            update_world(step)
+            sim_acc -= step
+            n += 1
+        if n >= CFG.feel.max_sim_steps:
+            sim_acc = 0.0
+
+        if state == "fight":
+            if intro <= 0:
+                timer = max(0.0, timer - dt)
+            if not p.alive or not e.alive or timer <= 0:
+                state = "ko"
+                ko_timer = CFG.game.ko_time
+                say("K.O." if (not p.alive or not e.alive) else "TIME UP", 1.5)
+                add_shake(10)
+        else:
+            ko_timer -= dt
+            if ko_timer <= 0:
+                finish()
+        cam.update(dt, p, e)
 
     # ---- draw
     if state == "menu":
+        target(UI)
         menu(t)
     elif state == "shop":
+        target(UI)
         shop(t)
     elif state in ("fight", "ko"):
+        target(WORLD)
         draw_world(t)
+        target(UI)
+        cam.apply(WORLD, UI)
         hud()
         if state == "ko":
             ov = pygame.Surface((W, H), pygame.SRCALPHA)
             ov.fill((0, 0, 0, 90))
-            screen.blit(ov, (0, 0))
+            UI.blit(ov, (0, 0))
     else:
-        result_screen(t)
+        target(WORLD)
+        arena(t)
+        for fighter in sorted((p, e), key=lambda z: z.y):
+            fighter.draw()
+        target(UI)
+        cam.apply(WORLD, UI)
+        result_overlay()
 
     if banner_t > 0 and state in ("fight", "ko"):
         a = min(1.0, banner_t / 0.4)
         sc = 1.0 + (1 - min(1.0, banner_t)) * 0.0
         col = shade(GOLD, 0.4 + 0.6 * a)
-        txt(banner, (W // 2, 300), XL if state == "ko" else B, col, True)
+        txt(banner, (W // 2, 300), XL if state == "ko" else B, col, True, surf=UI)
 
     if flash > 0:
         ov = pygame.Surface((W, H), pygame.SRCALPHA)
         ov.fill((255, 90, 90, int(min(110, flash))))
-        screen.blit(ov, (0, 0))
+        UI.blit(ov, (0, 0))
     return running
 
 
@@ -2030,9 +2266,9 @@ def debug_overlay():
     ]
     pad = pygame.Surface((330, 18 * len(rows) + 14), pygame.SRCALPHA)
     pad.fill((0, 0, 0, 165))
-    screen.blit(pad, (10, 96))
+    UI.blit(pad, (10, 96))
     for i, (line, col) in enumerate(rows):
-        txt(line, (20, 104 + i * 18), SM, col)
+        txt(line, (20, 104 + i * 18), SM, col, surf=UI)
 
 
 def main():
@@ -2046,11 +2282,7 @@ def main():
         if CFG.debug.overlay:
             debug_overlay()
 
-        display.fill(BLACK)
-        if shake > 0.4:
-            display.blit(screen, (random.uniform(-shake, shake), random.uniform(-shake, shake)))
-        else:
-            display.blit(screen, (0, 0))
+        display.blit(UI, (0, 0))
         pygame.display.flip()
         frame_ms.append((time.perf_counter() - t0) * 1000.0)
     pygame.quit()
