@@ -16,6 +16,8 @@ import os
 import json
 import math
 import random
+import time
+from collections import deque
 
 import pygame
 
@@ -53,8 +55,48 @@ GREEN = (70, 220, 125);  RED = (235, 60, 75);   CYAN = (65, 220, 240)
 BLUE = (65, 125, 235);   GREY = (80, 92, 108);  DIM = (150, 165, 182)
 SKIN = (226, 190, 162)
 
-DEV_MODE = True           # every shop item is free while the game is unreleased
-ROUND_TIME = 90.0         # seconds per round before the match goes to a decision
+# --------------------------------------------------------------------------
+# CONFIG
+# Every tunable value in the game lives here under a named key. Sections are
+# added as each phase lands; nothing outside this block should hold a magic
+# number you would reasonably want to dial.
+# --------------------------------------------------------------------------
+class Cfg(dict):
+    """A dict you can also reach with dots, so CFG.arena.ground_top works."""
+    __getattr__ = dict.__getitem__
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+
+CFG = Cfg(
+    game=Cfg(
+        dev_mode=True,          # every shop item is free while the game is unreleased
+        round_time=90.0,        # seconds before the match goes to a decision
+        intro_time=1.3,         # "FIGHT!" hold before the AI engages
+        ko_time=1.5,            # slow-motion hold after a knockout
+        ko_timescale=0.30,      # how slowly that hold runs
+        hitstop_timescale=0.25,  # time dilation during an impact freeze
+    ),
+    arena=Cfg(
+        ground_top=415,         # nearest / furthest the feet may stand
+        ground_bottom=578,
+        margin_x=120,           # walkable inset from the screen edge
+        depth_squash=0.62,      # vertical movement is foreshortened by this
+        scale_near=0.98,        # figure scale at ground_top ...
+        scale_range=0.30,       # ... growing by this much at ground_bottom
+    ),
+    glow=Cfg(
+        alpha=40,               # peak additive alpha at a glow's centre
+        falloff=2.6,            # higher = tighter core, softer edge
+        radius_step=3,          # cache-key quantisation keeps the cache bounded
+        color_step=12,
+        cache_max=192,
+    ),
+    debug=Cfg(
+        overlay=False,          # F3 toggles the frame-time readout
+        samples=90,             # rolling window for the ms/frame average
+    ),
+)
 
 # --------------------------------------------------------------------------
 # audio — synthesised at boot, silently skipped if numpy/audio is unavailable
@@ -229,7 +271,7 @@ load_save()
 # --------------------------------------------------------------------------
 particles = []; shots = []; zones = []; floaters = []
 state = "menu"; pick = 0; p = e = None; result = ""
-timer = ROUND_TIME; intro = 0.0; ko_timer = 0.0
+timer = CFG.game.round_time; intro = 0.0; ko_timer = 0.0
 shop_sel = 0
 shake = 0.0; flash = 0.0
 banner = ""; banner_t = 0.0
@@ -252,22 +294,36 @@ _glow_cache = {}
 
 
 def glow_surf(radius, color):
-    key = (radius, color)
+    """Cached radial glow.
+
+    The key is quantised: callers pass continuously-varying colours (a fading
+    zone, a pulsing aura), and an exact key meant a fresh bake plus a new cache
+    entry every single frame — an unbounded leak. Snapping radius and colour to
+    a step makes the key set finite and the cache a real cache.
+    """
+    step = CFG.glow.color_step
+    radius = max(2, int(radius) // CFG.glow.radius_step * CFG.glow.radius_step)
+    key = (radius,
+           int(color[0]) // step * step,
+           int(color[1]) // step * step,
+           int(color[2]) // step * step)
     g = _glow_cache.get(key)
     if g is None:
+        if len(_glow_cache) >= CFG.glow.cache_max:
+            _glow_cache.clear()
         g = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
         for r in range(radius, 0, -1):
-            a = int(40 * (1 - r / radius) ** 2.6)
+            a = int(CFG.glow.alpha * (1 - r / radius) ** CFG.glow.falloff)
             if a:
-                pygame.draw.circle(g, (color[0], color[1], color[2], a), (radius, radius), r)
+                pygame.draw.circle(g, (key[1], key[2], key[3], a), (radius, radius), r)
         _glow_cache[key] = g
     return g
 
 
 def glow(x, y, radius, color, surf=None):
-    surf = surf or screen
-    surf.blit(glow_surf(int(radius), color), (x - radius, y - radius),
-              special_flags=pygame.BLEND_RGBA_ADD)
+    g = glow_surf(radius, color)
+    r = g.get_width() // 2          # the cache may have rounded the radius
+    (surf or screen).blit(g, (x - r, y - r), special_flags=pygame.BLEND_RGBA_ADD)
 
 
 def limb(a, b, w, col, surf=None):
@@ -325,7 +381,9 @@ def say(text, secs=1.1):
 # the stadium — baked once so nothing flickers and the frame stays cheap
 # --------------------------------------------------------------------------
 PITCH = pygame.Rect(20, 195, W - 40, 470)      # ground ellipse
-GROUND_TOP, GROUND_BOTTOM = 415, 578           # walkable band (fighters' feet)
+# derived from CFG so the hot paths below read cleanly; edit CFG.arena, not these
+GROUND_TOP, GROUND_BOTTOM = CFG.arena.ground_top, CFG.arena.ground_bottom
+MARGIN_X = CFG.arena.margin_x
 
 
 def build_arena():
@@ -382,15 +440,23 @@ def build_arena():
     pygame.draw.circle(bg, shade(line, 0.8), (W // 2, PITCH.centery), 5)
     pygame.draw.line(bg, line, (W // 2, PITCH.top + 16), (W // 2, PITCH.bottom - 16), 2)
 
-    # goal frames at both ends
-    for gx, side in ((48, 1), (W - 108, -1)):
-        pygame.draw.rect(bg, (26, 36, 50), (gx, 300, 60, 210), 0, border_radius=8)
-        pygame.draw.rect(bg, (48, 64, 84), (gx, 300, 60, 210), 4, border_radius=8)
-        pygame.draw.rect(bg, shade(CYAN, 0.55), (gx + 9, 314, 42, 182), 2, border_radius=5)
-        for yy in range(322, 496, 17):
-            pygame.draw.line(bg, (30, 70, 84), (gx + 11, yy), (gx + 49, yy), 1)
-        for xx in range(gx + 12, gx + 50, 10):
-            pygame.draw.line(bg, (30, 70, 84), (xx, 316), (xx, 494), 1)
+    # player tunnels at both ends — arched mouths cut into the lower stand,
+    # with a warm interior light, plus the hoardings that fence them off
+    for tx in (36, W - 116):
+        mouth = pygame.Rect(tx, 296, 80, 150)
+        pygame.draw.rect(bg, (7, 9, 14), mouth, border_radius=38)          # opening
+        for i in range(5):                                                 # depth falloff
+            inner = mouth.inflate(-10 - i * 9, -10 - i * 9)
+            inner.bottom = mouth.bottom - 4
+            v = 10 + i * 5
+            pygame.draw.rect(bg, (v + 6, v + 3, v), inner, border_radius=26)
+        pygame.draw.rect(bg, (44, 56, 72), mouth, 4, border_radius=38)     # frame
+        pygame.draw.rect(bg, (74, 92, 116), (tx + 6, 290, 68, 8), border_radius=3)
+        # barrier rail in front of the tunnel
+        for yy in (452, 466):
+            pygame.draw.line(bg, (52, 64, 82), (tx - 6, yy), (tx + 86, yy), 3)
+        for xx in range(tx - 4, tx + 88, 21):
+            pygame.draw.line(bg, (40, 50, 66), (xx, 448), (xx, 470), 3)
 
     # floodlight towers (the lamp glow itself is animated at runtime)
     for x in (96, W - 108):
@@ -402,17 +468,23 @@ def build_arena():
     return bg
 
 
-ARENA = build_arena()
+def build_vignette(depth=170, peak=140):
+    v = pygame.Surface((W, H), pygame.SRCALPHA)
+    for i in range(depth):
+        c = (0, 0, 0, int(peak * (1 - i / depth) ** 2.1))
+        pygame.draw.line(v, c, (0, i), (W, i))
+        pygame.draw.line(v, c, (0, H - 1 - i), (W, H - 1 - i))
+        pygame.draw.line(v, c, (i, 0), (i, H))
+        pygame.draw.line(v, c, (W - 1 - i, 0), (W - 1 - i, H))
+    return v
 
-VIGNETTE = pygame.Surface((W, H), pygame.SRCALPHA)
-_d = 170
-for _i in range(_d):
-    _a = int(140 * (1 - _i / _d) ** 2.1)
-    _c = (0, 0, 0, _a)
-    pygame.draw.line(VIGNETTE, _c, (0, _i), (W, _i))
-    pygame.draw.line(VIGNETTE, _c, (0, H - 1 - _i), (W, H - 1 - _i))
-    pygame.draw.line(VIGNETTE, _c, (_i, 0), (_i, H))
-    pygame.draw.line(VIGNETTE, _c, (W - 1 - _i, 0), (W - 1 - _i, H))
+
+ARENA = build_arena()
+# The vignette is static and sits *under* the characters, so it is baked into
+# the arena once instead of being alpha-blitted every frame (measured 0.43 ms —
+# 43% of the whole frame). Phase D moves vignetting into the post chain, where
+# it will correctly darken the characters too; this bake comes back out then.
+ARENA.blit(build_vignette(), (0, 0))
 
 
 def arena(t):
@@ -429,7 +501,6 @@ def arena(t):
         ph = (math.sin(t * 2.6 - i * 0.35) + 1) * 0.5
         c = (int(14 + 40 * ph), int(40 + 120 * ph), int(60 + 150 * ph))
         pygame.draw.rect(screen, c, (x, 664, 30, 9), border_radius=3)
-    screen.blit(VIGNETTE, (0, 0))
 
 
 # --------------------------------------------------------------------------
@@ -591,7 +662,8 @@ class Fighter:
     # ---- geometry -------------------------------------------------------
     def scale(self):
         """Fighters further up the pitch stand smaller — cheap real depth."""
-        return 0.98 + (self.y - GROUND_TOP) / (GROUND_BOTTOM - GROUND_TOP) * 0.30
+        return CFG.arena.scale_near + ((self.y - GROUND_TOP) /
+                (GROUND_BOTTOM - GROUND_TOP)) * CFG.arena.scale_range
 
     # ---- damage ---------------------------------------------------------
     def hit(self, damage):
@@ -642,13 +714,13 @@ class Fighter:
             if self.atk > 0:
                 sp *= 0.55                     # committed to a strike, but not frozen
             self.x += dx / q * sp * dt
-            self.y += dy / q * sp * dt * 0.62  # the pitch is seen at an angle
+            self.y += dy / q * sp * dt * CFG.arena.depth_squash  # seen at an angle
             if abs(dx) > 0 and self.atk <= 0:
                 self.facing = 1 if dx > 0 else -1
         self.clamp()
 
     def clamp(self):
-        self.x = max(120, min(W - 120, self.x))
+        self.x = max(MARGIN_X, min(W - MARGIN_X, self.x))
         self.y = max(GROUND_TOP, min(GROUND_BOTTOM, self.y))
 
     # ---- attacking ------------------------------------------------------
@@ -787,7 +859,7 @@ class Fighter:
 
     def dash(self, t, damage, length):
         ox, oy = self.x, self.y
-        self.x = max(120, min(W - 120, self.x + self.facing * length))
+        self.x = max(MARGIN_X, min(W - MARGIN_X, self.x + self.facing * length))
         for i in range(12):                                    # after-image trail
             f = i / 12
             particles.append([ox + (self.x - ox) * f, oy - 80 + random.uniform(-22, 22),
@@ -1228,7 +1300,7 @@ def shop(t):
     pygame.draw.rect(screen, (11, 17, 27), (0, 0, W, 128))
     pygame.draw.line(screen, (40, 52, 68), (0, 128), (W, 128), 2)
     txt("SPIRIT SHOP", (40, 26), B, GOLD)
-    txt("DEVELOPMENT MODE — EVERY ITEM IS FREE" if DEV_MODE else "SPEND YOUR GEMS",
+    txt("DEVELOPMENT MODE — EVERY ITEM IS FREE" if CFG.game.dev_mode else "SPEND YOUR GEMS",
         (44, 90), S, GREEN)
     txt("GEMS  ∞", (W - 44 - F.size("GEMS  ∞")[0], 34), F, CYAN)
 
@@ -1256,7 +1328,7 @@ def shop(t):
         txt(cat, (x + 14, y + 8), SM, ccol)
         txt(name, (x + 14, y + 24), F, WHITE if not on else GREEN)
         txt(desc, (x + 14, y + 50), SM, (168, 182, 198))
-        tag = "EQUIPPED" if on else ("FREE" if DEV_MODE else "BUY")
+        tag = "EQUIPPED" if on else ("FREE" if CFG.game.dev_mode else "BUY")
         tw = SM.size(tag)[0]
         pygame.draw.rect(screen, (34, 74, 48) if on else (44, 52, 66),
                          (x + 296 - tw - 22, y + 8, tw + 14, 18), border_radius=4)
@@ -1339,8 +1411,8 @@ def start():
     apply_loadout(p)
     e = Fighter(random.choice([n for n in names if n != p.n]), 900, 505, 0)
     state = "fight"
-    timer = ROUND_TIME
-    intro = 1.3
+    timer = CFG.game.round_time
+    intro = CFG.game.intro_time
     ko_timer = 0.0
     particles = []; shots = []; zones = []; floaters = []
     result = ""
@@ -1446,6 +1518,8 @@ def frame(events, dt, t):
     for ev in events:
         if ev.type == pygame.QUIT:
             running = False
+        elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_F3:
+            CFG.debug.overlay = not CFG.debug.overlay      # works in every state
         elif ev.type == pygame.KEYDOWN:
             if state == "menu":
                 if ev.key in (pygame.K_RIGHT, pygame.K_d):
@@ -1514,7 +1588,7 @@ def frame(events, dt, t):
     if state == "fight":
         intro = max(0.0, intro - dt)
         k = pygame.key.get_pressed()
-        scale = 0.25 if (p.hitstop > 0 or e.hitstop > 0) else 1.0
+        scale = CFG.game.hitstop_timescale if (p.hitstop > 0 or e.hitstop > 0) else 1.0
         sdt = dt * scale
         p.move(k[pygame.K_d] - k[pygame.K_a], k[pygame.K_s] - k[pygame.K_w], sdt)
         p.up(sdt); e.up(sdt)
@@ -1524,11 +1598,11 @@ def frame(events, dt, t):
         update_world(sdt)
         if not p.alive or not e.alive or timer <= 0:
             state = "ko"
-            ko_timer = 1.5
+            ko_timer = CFG.game.ko_time
             say("K.O." if (not p.alive or not e.alive) else "TIME UP", 1.5)
             add_shake(10)
     elif state == "ko":
-        sdt = dt * 0.3                                # brief slow-motion finish
+        sdt = dt * CFG.game.ko_timescale              # brief slow-motion finish
         p.up(sdt); e.up(sdt)
         update_world(sdt)
         ko_timer -= dt
@@ -1563,18 +1637,50 @@ def frame(events, dt, t):
     return running
 
 
+frame_ms = deque(maxlen=CFG.debug.samples)
+
+
+def debug_overlay():
+    """F3 readout. Every phase reports frame cost, so the cost stays visible."""
+    if not frame_ms:
+        return
+    avg = sum(frame_ms) / len(frame_ms)
+    worst = max(frame_ms)
+    rows = [
+        (f"{avg:5.2f} ms  avg     ({1000 / max(avg, 1e-6):.0f} fps)",
+         GREEN if avg < 16.67 else RED),
+        (f"{worst:5.2f} ms  worst of last {len(frame_ms)}",
+         GREEN if worst < 16.67 else GOLD),
+        (f"budget 16.67 ms   headroom {16.67 - avg:5.2f} ms", DIM),
+        (f"particles {len(particles):<4} shots {len(shots):<3} "
+         f"zones {len(zones):<3} floaters {len(floaters)}", DIM),
+        (f"glow cache {len(_glow_cache)}/{CFG.glow.cache_max}   state {state}", DIM),
+    ]
+    pad = pygame.Surface((330, 18 * len(rows) + 14), pygame.SRCALPHA)
+    pad.fill((0, 0, 0, 165))
+    screen.blit(pad, (10, 96))
+    for i, (line, col) in enumerate(rows):
+        txt(line, (20, 104 + i * 18), SM, col)
+
+
 def main():
     running = True
     while running:
         dt = min(clock.tick(60) / 1000.0, 0.05)
         t = pygame.time.get_ticks() / 1000.0
+        t0 = time.perf_counter()
+
         running = frame(pygame.event.get(), dt, t)
+        if CFG.debug.overlay:
+            debug_overlay()
+
         display.fill(BLACK)
         if shake > 0.4:
             display.blit(screen, (random.uniform(-shake, shake), random.uniform(-shake, shake)))
         else:
             display.blit(screen, (0, 0))
         pygame.display.flip()
+        frame_ms.append((time.perf_counter() - t0) * 1000.0)
     pygame.quit()
 
 
