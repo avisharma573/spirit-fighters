@@ -99,8 +99,8 @@ CFG = Cfg(
         hitstop_timescale=0.25,  # time dilation during an impact freeze
     ),
     arena=Cfg(
-        ground_top=415,         # nearest / furthest the feet may stand
-        ground_bottom=578,
+        ground_top=456,         # nearest / furthest the feet may stand
+        ground_bottom=604,
         margin_x=120,           # walkable inset from the screen edge
         depth_squash=0.62,      # vertical movement is foreshortened by this
         scale_near=0.98,        # figure scale at ground_top ...
@@ -163,7 +163,7 @@ CFG = Cfg(
         lookahead=0.16,         # lead the camera along the fighters' velocity
         follow=6.5,             # position spring rate
         zoom_follow=3.4,        # framing spring rate (slower = calmer)
-        bias_y=-78.0,           # lift the framing so the stands stay in shot
+        bias_y=-172.0,          # lift the framing so the stands stay in shot
     ),
     debug=Cfg(
         overlay=False,          # F3 toggles the frame-time readout
@@ -368,12 +368,16 @@ _glow_cache = {}
 
 
 def glow_surf(radius, color):
-    """Cached radial glow.
+    """Cached radial glow, built for additive blending.
 
-    The key is quantised: callers pass continuously-varying colours (a fading
-    zone, a pulsing aura), and an exact key meant a fresh bake plus a new cache
-    entry every single frame — an unbounded leak. Snapping radius and colour to
-    a step makes the key set finite and the cache a real cache.
+    BLEND_RGBA_ADD adds the source RGB and ignores its alpha, so an alpha ramp
+    does nothing — every pixel inside the disc adds the full colour, which is
+    why a glow built that way renders as a hard-edged blob. The falloff has to
+    live in the RGB itself: each ring is the colour scaled by its intensity,
+    at full alpha.
+
+    The key is quantised because callers pass continuously-varying colours
+    (a fading zone, a pulsing aura); an exact key leaked a surface per frame.
     """
     step = CFG.glow.color_step
     radius = max(2, int(radius) // CFG.glow.radius_step * CFG.glow.radius_step)
@@ -386,10 +390,12 @@ def glow_surf(radius, color):
         if len(_glow_cache) >= CFG.glow.cache_max:
             _glow_cache.clear()
         g = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+        r0, g0, b0 = key[1], key[2], key[3]
         for r in range(radius, 0, -1):
-            a = int(CFG.glow.alpha * (1 - r / radius) ** CFG.glow.falloff)
-            if a:
-                pygame.draw.circle(g, (key[1], key[2], key[3], a), (radius, radius), r)
+            f = (1 - r / radius) ** CFG.glow.falloff
+            c = (int(r0 * f), int(g0 * f), int(b0 * f), 255)
+            if c[0] or c[1] or c[2]:
+                pygame.draw.circle(g, c, (radius, radius), r)
         _glow_cache[key] = g
     return g
 
@@ -477,98 +483,199 @@ def say(text, secs=1.1):
 # --------------------------------------------------------------------------
 # the stadium — baked once so nothing flickers and the frame stays cheap
 # --------------------------------------------------------------------------
-PITCH = pygame.Rect(int(ks(20)), int(ks(195)), int(ks(1280 - 40)), int(ks(470)))
+HORIZON = 470                   # world y where the stands end and turf begins
+PITCH = pygame.Rect(int(ks(20)), HORIZON, int(ks(1280 - 40)), 400)
 # derived from CFG so the hot paths below read cleanly; edit CFG.arena, not these
 GROUND_TOP = ks(CFG.arena.ground_top)
 GROUND_BOTTOM = ks(CFG.arena.ground_bottom)
 MARGIN_X = ks(CFG.arena.margin_x)
 
 
-def build_arena():
-    """Bake the stadium once, authored in 1280x720 design units via ks()."""
-    bg = pygame.Surface((WW, WH)).convert()
-    rng = random.Random(20240913)
+# --------------------------------------------------------------------------
+# PHASE D — layered stadium with parallax and atmospheric perspective
+#
+# The background used to be one flat bake. It is now six layers at different
+# depths. Distant layers are desaturated and washed toward the sky colour, are
+# softened, and move less as the camera pans; the nearest layer passes in FRONT
+# of the fighters. That separation is what reads as real depth.
+# --------------------------------------------------------------------------
+PAD = 300                       # slack each side so panning never shows an edge
+LW = WW + PAD * 2
+SKYTOP = (6, 9, 18)
+SKYHORIZON = (21, 30, 49)
+HAZE = (30, 44, 66)             # colour distant things wash out toward
 
-    # night sky above the bowl
-    horizon = int(ks(240))
-    for y in range(0, horizon):
-        t = y / horizon
-        pygame.draw.line(bg, (int(6 + t * 8), int(9 + t * 13), int(18 + t * 22)),
-                         (0, y), (WW, y))
-    for _ in range(110):                                   # stars through the roof
-        sx, sy = rng.randint(0, WW), rng.randint(0, int(ks(80)))
-        v = rng.randint(60, 130)
-        pygame.draw.circle(bg, (v, v, v + 20), (sx, sy), 1)
 
-    # roof trusses
-    for x in range(int(-ks(140)), int(WW + ks(160)), int(ks(105))):
-        pygame.draw.line(bg, (36, 45, 60), (x, ks(40)), (x + ks(120), ks(150)), 3)
-        pygame.draw.line(bg, (26, 33, 45), (x + ks(120), ks(150)), (x + ks(120), ks(190)), 2)
-    pygame.draw.rect(bg, (17, 22, 33), (0, ks(150), WW, ks(44)))
+def tint(surf, col, amount):
+    """Atmospheric perspective: wash a layer toward the haze colour."""
+    if amount <= 0:
+        return surf
+    ov = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+    ov.fill((col[0], col[1], col[2], int(255 * amount)))
+    surf.blit(ov, (0, 0))
+    return surf
 
-    # crowd — three tiers, each darker with distance
-    tiers = [(196, 3, (26, 32, 44)), (154, 3, (20, 25, 36)), (118, 2, (15, 19, 28))]
-    seat = int(ks(5)) + 1
-    for base_y, rows, col_seat in tiers:
-        pygame.draw.rect(bg, col_seat,
-                         (0, ks(base_y) - ks(rows * 13 + 4), WW, ks(rows * 13 + 8)))
-        for r in range(rows):
-            yy = ks(base_y) - r * ks(13)
-            for x in range(int(-ks(6)), int(WW + ks(10)), int(ks(8))):
-                if rng.random() < 0.14:
-                    continue
-                v = max(8, rng.randint(24, 52) - r * 5)
-                c = (v, v + 3, v + 11)
-                if rng.random() < 0.022:
-                    c = rng.choice([(104, 44, 44), (44, 74, 116),
-                                    (118, 100, 46), (46, 104, 76)])
-                pygame.draw.rect(bg, c, (x, yy + rng.randint(-2, 1), seat, seat))
-    pygame.draw.rect(bg, (9, 12, 19), (0, ks(200), WW, ks(16)))   # shadow under stands
 
-    # the pitch: concentric bands read as mown rings under stadium light
-    for j in range(9):
+def soften(surf, amount):
+    """Cheap depth-of-field: round-trip through a smaller surface."""
+    if amount <= 1:
+        return surf
+    w, h = surf.get_size()
+    small = pygame.transform.smoothscale(surf, (max(1, w // amount), max(1, h // amount)))
+    return pygame.transform.smoothscale(small, (w, h))
+
+
+def _layer(h, alpha=True):
+    return pygame.Surface((LW, h), pygame.SRCALPHA if alpha else 0)
+
+
+def build_sky():
+    sky = pygame.Surface((LW, 500)).convert()
+    h = sky.get_height()
+    for y in range(h):
+        u = y / h
+        sky.fill((int(SKYTOP[0] + (SKYHORIZON[0] - SKYTOP[0]) * u),
+                  int(SKYTOP[1] + (SKYHORIZON[1] - SKYTOP[1]) * u),
+                  int(SKYTOP[2] + (SKYHORIZON[2] - SKYTOP[2]) * u)), (0, y, LW, 1))
+    rng = random.Random(7)
+    for _ in range(260):                                   # stars
+        sx, sy = rng.randint(0, LW), rng.randint(0, int(h * 0.72))
+        v = rng.randint(45, 150)
+        r = 1 if v < 120 else 2
+        pygame.draw.circle(sky, (v, v, min(255, v + 25)), (sx, sy), r)
+    mx, my = int(LW * 0.76), int(ks(66))                   # moon, with a halo
+    glow(mx, my, int(ks(120)), (52, 58, 78), surf=sky)
+    pygame.draw.circle(sky, (214, 218, 232), (mx, my), int(ks(26)))
+    pygame.draw.circle(sky, (188, 194, 212), (mx - int(ks(7)), my - int(ks(5))), int(ks(7)))
+    pygame.draw.circle(sky, (196, 201, 218), (mx + int(ks(9)), my + int(ks(8))), int(ks(5)))
+    # thin cloud bands catching the moonlight
+    for i in range(7):
+        cy = rng.randint(int(ks(30)), int(ks(210)))
+        cw = rng.randint(int(ks(200)), int(ks(560)))
+        cx = rng.randint(0, LW)
+        band = pygame.Surface((cw, int(ks(26))), pygame.SRCALPHA)
+        pygame.draw.ellipse(band, (58, 66, 88, 46), band.get_rect())
+        sky.blit(soften(band, 3), (cx, cy))
+    return sky
+
+
+def _crowd(surf, y0, rows, seat_col, density, rng, bright=0.02):
+    pygame.draw.rect(surf, seat_col, (0, y0 - ks(4), LW, rows * ks(13) + ks(8)))
+    sz = max(2, int(ks(5)))
+    for r in range(rows):
+        yy = y0 + r * ks(13)
+        for x in range(0, LW, int(ks(8))):
+            if rng.random() > density:
+                continue
+            v = max(8, rng.randint(26, 54) - r * 4)
+            c = (v, v + 3, v + 11)
+            if rng.random() < bright:
+                c = rng.choice([(104, 44, 44), (44, 74, 116), (118, 100, 46), (46, 104, 76)])
+            pygame.draw.rect(surf, c, (x, yy + rng.randint(-2, 1), sz, sz))
+
+
+def build_far():
+    """Upper deck across the back of the bowl — hazy and out of focus."""
+    lay = _layer(260)
+    rng = random.Random(11)
+    _crowd(lay, ks(60), 5, (17, 22, 33), 0.80, rng, 0.012)
+    for x in range(0, LW, int(ks(150))):                   # structural ribs
+        pygame.draw.line(lay, (26, 33, 46), (x, ks(30)), (x, ks(150)), max(1, int(ks(3))))
+    lay = soften(lay, 3)
+    return tint(lay, HAZE, 0.55)
+
+
+def build_mid():
+    """Main tier plus the roof trusses."""
+    lay = _layer(300)
+    rng = random.Random(23)
+    for x in range(int(-ks(140)), LW + int(ks(160)), int(ks(105))):
+        pygame.draw.line(lay, (38, 48, 64), (x, ks(10)), (x + ks(120), ks(120)), max(2, int(ks(3))))
+    pygame.draw.rect(lay, (19, 25, 37), (0, ks(120), LW, ks(40)))
+    _crowd(lay, ks(150), 4, (22, 28, 40), 0.86, rng, 0.022)
+    lay = soften(lay, 2)
+    return tint(lay, HAZE, 0.28)
+
+
+def build_near():
+    """Lower bowl: tunnels, floodlight towers, perimeter hoardings."""
+    lay = _layer(360)
+    rng = random.Random(31)
+    _crowd(lay, ks(10), 3, (26, 33, 47), 0.9, rng, 0.03)
+    pygame.draw.rect(lay, (11, 15, 23), (0, ks(78), LW, ks(18)))      # shadow line
+    for tx in (PAD + ks(36), PAD + WW - ks(116)):                     # tunnels
+        mouth = pygame.Rect(int(tx), int(ks(96)), int(ks(80)), int(ks(150)))
+        rad = int(ks(38))
+        pygame.draw.rect(lay, (7, 9, 14), mouth, border_radius=rad)
+        for i in range(5):
+            inner = mouth.inflate(-ks(10 + i * 9), -ks(10 + i * 9))
+            inner.bottom = mouth.bottom - int(ks(4))
+            v = 12 + i * 6
+            pygame.draw.rect(lay, (v + 8, v + 4, v), inner, border_radius=int(ks(26)))
+        pygame.draw.rect(lay, (46, 58, 74), mouth, int(ks(4)), border_radius=rad)
+        pygame.draw.rect(lay, (76, 94, 118), (tx + ks(6), ks(90), ks(68), ks(8)), border_radius=3)
+    for x in (PAD + ks(96), PAD + WW - ks(108)):                      # light towers
+        pygame.draw.rect(lay, (36, 44, 56), (x, ks(0), ks(14), ks(190)), border_radius=4)
+        pygame.draw.rect(lay, (46, 56, 70), (x - ks(14), ks(-8), ks(42), ks(22)), border_radius=5)
+    return lay
+
+
+def build_pitch():
+    """The ground the fighters stand on. Parallax 1.0 — no offset, no padding."""
+    g = pygame.Surface((WW, WH), pygame.SRCALPHA)
+    g.fill((9, 13, 20, 255), pygame.Rect(0, HORIZON - 8, WW, WH - HORIZON + 8))
+    for j in range(9):                                     # mown rings
         f = 1 - j * 0.105
         tone = 1.0 + (0.16 if j % 2 else 0.0)
         col = shade((17, 40, 33), tone + (8 - j) * 0.02)
         rect = pygame.Rect(0, 0, int(PITCH.w * f), int(PITCH.h * f))
         rect.center = (PITCH.centerx, PITCH.centery)
-        pygame.draw.ellipse(bg, col, rect)
-
-    # markings
+        pygame.draw.ellipse(g, col, rect)
     line = (74, 122, 140)
-    pygame.draw.ellipse(bg, line, PITCH, int(ks(4)))
-    pygame.draw.ellipse(bg, shade(line, 0.6), PITCH.inflate(-ks(150), -ks(110)), 2)
-    pygame.draw.circle(bg, line, (WW // 2, PITCH.centery), int(ks(118)), 2)
-    pygame.draw.circle(bg, line, (WW // 2, PITCH.centery), int(ks(40)), 2)
-    pygame.draw.circle(bg, shade(line, 0.8), (WW // 2, PITCH.centery), int(ks(5)))
-    pygame.draw.line(bg, line, (WW // 2, PITCH.top + ks(16)),
+    pygame.draw.ellipse(g, line, PITCH, int(ks(4)))
+    pygame.draw.ellipse(g, shade(line, 0.6), PITCH.inflate(-ks(150), -ks(110)), 2)
+    pygame.draw.circle(g, line, (WW // 2, PITCH.centery), int(ks(118)), 2)
+    pygame.draw.circle(g, line, (WW // 2, PITCH.centery), int(ks(40)), 2)
+    pygame.draw.circle(g, shade(line, 0.8), (WW // 2, PITCH.centery), int(ks(5)))
+    pygame.draw.line(g, line, (WW // 2, PITCH.top + ks(16)),
                      (WW // 2, PITCH.bottom - ks(16)), 2)
+    # pools of floodlight on the turf, and a specular sheen down the middle
+    for lx in (ks(260), WW - ks(260)):
+        glow(lx, PITCH.centery, int(ks(300)), (16, 19, 15), surf=g)
+    # Crop to the ground band and drop the alpha channel: everything below the
+    # horizon is solid, and an opaque blit is far cheaper than a full-size
+    # SRCALPHA one that is mostly empty.
+    band = pygame.Rect(0, HORIZON - 8, WW, WH - HORIZON + 8)
+    return g.subsurface(band).copy().convert()
 
-    # player tunnels at both ends, with barrier rails
-    for tx in (ks(36), WW - ks(116)):
-        mouth = pygame.Rect(int(tx), int(ks(296)), int(ks(80)), int(ks(150)))
-        rad = int(ks(38))
-        pygame.draw.rect(bg, (7, 9, 14), mouth, border_radius=rad)
-        for i in range(5):
-            inner = mouth.inflate(-ks(10 + i * 9), -ks(10 + i * 9))
-            inner.bottom = mouth.bottom - int(ks(4))
-            v = 10 + i * 5
-            pygame.draw.rect(bg, (v + 6, v + 3, v), inner, border_radius=int(ks(26)))
-        pygame.draw.rect(bg, (44, 56, 72), mouth, int(ks(4)), border_radius=rad)
-        pygame.draw.rect(bg, (74, 92, 116),
-                         (tx + ks(6), ks(290), ks(68), ks(8)), border_radius=3)
-        for yy in (ks(452), ks(466)):
-            pygame.draw.line(bg, (52, 64, 82), (tx - ks(6), yy), (tx + ks(86), yy), int(ks(3)))
-        for xx in range(int(tx - ks(4)), int(tx + ks(88)), int(ks(21))):
-            pygame.draw.line(bg, (40, 50, 66), (xx, ks(448)), (xx, ks(470)), int(ks(3)))
 
-    # floodlight towers (the lamps themselves are animated at runtime)
-    for x in (ks(96), WW - ks(108)):
-        pygame.draw.rect(bg, (34, 42, 54), (x, ks(112), ks(14), ks(100)), border_radius=4)
-        pygame.draw.rect(bg, (44, 54, 68), (x - ks(14), ks(96), ks(42), ks(20)), border_radius=5)
+def build_fore():
+    """Barrier rail that passes in FRONT of the fighters."""
+    lay = _layer(90)
+    pygame.draw.rect(lay, (13, 18, 27), (0, ks(30), LW, ks(30)))
+    for yy in (ks(16), ks(32)):
+        pygame.draw.line(lay, (54, 66, 84), (0, yy), (LW, yy), max(2, int(ks(4))))
+    for xx in range(0, LW, int(ks(30))):
+        pygame.draw.line(lay, (40, 50, 66), (xx, ks(10)), (xx, ks(36)), max(2, int(ks(4))))
+    return lay
 
-    pygame.draw.rect(bg, (14, 20, 30), (0, ks(664), WW, ks(10)))   # perimeter boards
-    return bg
+
+class Layer:
+    __slots__ = ("surf", "y", "px", "pad")
+
+    def __init__(self, surf, y, px, pad=True):
+        self.surf = surf; self.y = y; self.px = px; self.pad = pad
+
+
+SKY = build_sky()
+LAYERS = [
+    Layer(SKY, 0, 0.06),                 # sky + moon, barely moves
+    Layer(build_far(), 190, 0.22),       # upper deck, hazy and soft
+    Layer(build_mid(), 232, 0.40),       # main tier + roof trusses
+    Layer(build_near(), 300, 0.66),      # lower bowl, tunnels, light towers
+    Layer(build_pitch(), HORIZON - 8, 1.00, pad=False),
+]
+FORE = Layer(build_fore(), 800, 1.28)    # rail in front of the fighters
 
 
 def build_vignette(depth=170, peak=140):
@@ -583,28 +690,109 @@ def build_vignette(depth=170, peak=140):
     return v
 
 
-ARENA = build_arena()
-# The vignette is static and sits *under* the characters, so it is baked into
-# the arena once instead of being alpha-blitted every frame (measured 0.43 ms —
-# 43% of the whole frame). Phase D moves vignetting into the post chain, where
-# it will correctly darken the characters too; this bake comes back out then.
-ARENA.blit(build_vignette(), (0, 0))
+VIGNETTE = build_vignette()
+_flashes = []                    # crowd camera flashes: [x, y, life]
+_beam_cache = {}
+
+
+def _beam(i, spread, height, col, strength):
+    """A floodlight shaft. Built premultiplied for the same reason as glow()."""
+    # Quantise: the caller modulates strength with a sine, so an exact key
+    # rebuilt this surface — 30 polygons plus two smoothscales — every frame.
+    strength = round(strength, 2)
+    key = (i, strength)
+    b = _beam_cache.get(key)
+    if b is None:
+        b = pygame.Surface((int(spread * 2), int(height)), pygame.SRCALPHA)
+        steps = 30
+        for j in range(steps):
+            u = j / steps
+            w = spread * (0.16 + u * 0.84)
+            f = strength * (1 - u) ** 1.6
+            c = (int(col[0] * f), int(col[1] * f), int(col[2] * f), 255)
+            if not (c[0] or c[1] or c[2]):
+                continue
+            pygame.draw.polygon(b, c, [
+                (spread - w * 0.34, height * u), (spread + w * 0.34, height * u),
+                (spread + w * 0.5, height * (u + 1.0 / steps)),
+                (spread - w * 0.5, height * (u + 1.0 / steps))])
+        b = soften(b, 3)
+        _beam_cache[key] = b
+    return b
+
+
+def layer_offset(lay):
+    ox = (cam.x - WW * 0.5) * (1.0 - lay.px)
+    oy = (cam.y - WH * 0.5) * (1.0 - lay.px) * 0.5
+    return ox, oy
+
+
+def blit_layer(lay, view):
+    """Blit only the part of a layer the camera will sample.
+
+    Layers are wider than the world so panning never reveals an edge, but the
+    camera only ever sees ~1270 of those 2200 columns. Clipping to the view
+    turns every layer blit into at most one screenful.
+    """
+    ox, oy = layer_offset(lay)
+    dx = (-PAD + ox) if lay.pad else ox
+    dy = lay.y + oy
+    sx = max(0, int(view.x - dx))
+    sy = max(0, int(view.y - dy))
+    w = min(lay.surf.get_width() - sx, int(view.right - dx - sx))
+    h = min(lay.surf.get_height() - sy, int(view.bottom - dy - sy))
+    if w > 0 and h > 0:
+        screen.blit(lay.surf, (dx + sx, dy + sy), pygame.Rect(sx, sy, w, h))
 
 
 def arena(t):
-    screen.blit(ARENA, (0, 0))
-    # floodlights breathe very slightly, like real arc lamps
-    for x in (ks(103), WW - ks(101)):
-        b = 0.88 + 0.12 * math.sin(t * 1.7 + x)
+    """Draw the stadium, back to front, each layer at its own parallax rate."""
+    view = cam.view_rect()
+    for lay in LAYERS:
+        blit_layer(lay, view)
+
+    # --- volumetric floodlight beams from the towers down onto the turf
+    near = LAYERS[3]
+    ox, oy = layer_offset(near)
+    for i, lx in enumerate((ks(103), WW - ks(101))):
+        b = 0.86 + 0.14 * math.sin(t * 1.3 + i * 2.1)
+        beam = _beam(i, ks(330), 520, (176, 186, 205), 0.075 * b)
+        screen.blit(beam, (lx + ox - ks(330), 300 + oy),
+                    special_flags=pygame.BLEND_RGBA_ADD)
         for j in range(3):
-            cx, cy = x - ks(8) + j * ks(8), ks(104)
+            cx, cy = lx + ox - ks(8) + j * ks(8), 306 + oy
             pygame.draw.circle(screen, shade((255, 246, 216), b), (int(cx), int(cy)), int(ks(3)))
-            glow(cx, cy, int(ks(16) * b), (120, 118, 100))
-    # LED perimeter running colour along the boards
+            glow(cx, cy, int(ks(20) * b), (128, 126, 108))
+
+    # --- crowd camera flashes: the single cheapest cue that a stadium is alive
+    if random.random() < 0.55:
+        _flashes.append([random.uniform(0, WW), random.uniform(210, 470), 1.0])
+    for fl in _flashes[:]:
+        fl[2] -= 0.14
+        if fl[2] <= 0:
+            _flashes.remove(fl)
+            continue
+        fx, fy = fl[0] + ox * 0.6, fl[1] + oy * 0.6
+        glow(fx, fy, int(ks(13) * fl[2]), (255, 250, 225))
+        pygame.draw.circle(screen, shade((255, 252, 235), fl[2]), (int(fx), int(fy)), 2)
+
+    # --- drifting haze over the turf, so the air is not empty
+    for i in range(3):
+        hx = (t * (7 + i * 4) + i * 900) % (WW + ks(700)) - ks(350)
+        glow(hx, HORIZON + 30 + i * 70, 190, (15, 21, 29))
+
+    # --- LED perimeter running colour along the hoardings
     for i, x in enumerate(range(int(ks(40)), int(WW - ks(40)), int(ks(46)))):
         ph = (math.sin(t * 2.6 - i * 0.35) + 1) * 0.5
         c = (int(14 + 40 * ph), int(40 + 120 * ph), int(60 + 150 * ph))
-        pygame.draw.rect(screen, c, (x, ks(664), ks(30), ks(9)), border_radius=3)
+        pygame.draw.rect(screen, c, (x, PITCH.bottom - 26, ks(30), ks(9)), border_radius=3)
+
+    screen.blit(VIGNETTE, (view.x, view.y), view)
+
+
+def arena_foreground():
+    """The near barrier, drawn after the fighters so it occludes them."""
+    blit_layer(FORE, cam.view_rect())
 
 
 # --------------------------------------------------------------------------
@@ -2081,6 +2269,7 @@ def draw_world(t):
         a.draw()
     for a in floaters:
         a.draw()
+    arena_foreground()
 
 
 # --------------------------------------------------------------------------
@@ -2228,6 +2417,7 @@ def frame(events, dt, t):
         arena(t)
         for fighter in sorted((p, e), key=lambda z: z.y):
             fighter.draw()
+        arena_foreground()
         target(UI)
         cam.apply(WORLD, UI)
         result_overlay()
