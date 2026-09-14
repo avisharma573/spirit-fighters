@@ -165,6 +165,24 @@ CFG = Cfg(
         zoom_follow=3.4,        # framing spring rate (slower = calmer)
         bias_y=-172.0,          # lift the framing so the stands stay in shot
     ),
+    light=Cfg(                  # PHASE E — one directional source
+        angle=-118.0,           # degrees; where the key light comes FROM
+        color=(255, 244, 214),
+        rim=0.55,               # strength of the edge light on the figures
+        shadow_len=0.42,        # how far shadows are thrown along the light
+        shadow_alpha=118,
+    ),
+    post=Cfg(                   # PHASE E — post chain, deliberately SUBTLE
+        enabled=True,
+        bloom=0.85,             # additive strength of the bloom pass
+        bloom_soft=2,           # extra downsample steps; higher = wider glow
+        grade_gain=(255, 249, 240),   # multiply (highlights)
+        grade_lift=(5, 4, 9),         # add (shadows)
+        vignette=True,
+        grain=0.16,             # film grain opacity
+        grain_tiles=6,
+        chroma=0.0,             # edge chromatic aberration; 0 = off
+    ),
     debug=Cfg(
         overlay=False,          # F3 toggles the frame-time readout
         samples=90,             # rolling window for the ms/frame average
@@ -404,6 +422,10 @@ def glow(x, y, radius, color, surf=None):
     g = glow_surf(radius, color)
     r = g.get_width() // 2          # the cache may have rounded the radius
     (surf or screen).blit(g, (x - r, y - r), special_flags=pygame.BLEND_RGBA_ADD)
+    # Anything glowing in the world is by definition emissive, so it also goes
+    # into the bloom buffer. Explicit `surf=` callers are baking, not emitting.
+    if surf is None and screen is WORLD and CFG.post.enabled:
+        EMIS.blit(g, (x - r, y - r), special_flags=pygame.BLEND_RGBA_ADD)
 
 
 def limb(a, b, w, col, surf=None):
@@ -787,7 +809,8 @@ def arena(t):
         c = (int(14 + 40 * ph), int(40 + 120 * ph), int(60 + 150 * ph))
         pygame.draw.rect(screen, c, (x, PITCH.bottom - 26, ks(30), ks(9)), border_radius=3)
 
-    screen.blit(VIGNETTE, (view.x, view.y), view)
+    if not CFG.post.enabled:      # otherwise the post chain owns vignetting
+        screen.blit(VIGNETTE, (view.x, view.y), view)
 
 
 def arena_foreground():
@@ -1771,15 +1794,19 @@ class Fighter:
             k = 1.0 + self.flinch * 3
             body, dark, lite = shade(body, k), shade(dark, k), shade(lite, k)
 
-        # --- contact shadow: shrinks and fades as the hips leave the ground
+        # --- contact shadow, thrown along the key light and shrinking as the
+        # hips rise, so the figure reads as standing ON the pitch
         rest_h = CFG.motion.hip_h * s
         lift = max(0.0, (self.y - J["hip"][1]) - rest_h * 0.55) / max(rest_h, 1e-3)
         tight = max(0.35, 1.0 - lift * 0.8)
-        sw, sh_ = int(104 * s * tight), int(27 * s * tight)
+        sw, sh_ = int(112 * s * tight), int(28 * s * tight)
         if sw > 1 and sh_ > 1:
             sh_surf = pygame.Surface((sw, sh_), pygame.SRCALPHA)
-            pygame.draw.ellipse(sh_surf, (0, 0, 0, int(125 * tight)), sh_surf.get_rect())
-            screen.blit(sh_surf, (J["hip"][0] - sw / 2, self.y - sh_ * 0.35))
+            pygame.draw.ellipse(sh_surf, (0, 0, 0, int(CFG.light.shadow_alpha * tight)),
+                                sh_surf.get_rect())
+            throw = rest_h * CFG.light.shadow_len
+            screen.blit(sh_surf, (J["hip"][0] - sw / 2 - LIGHT_DX * throw,
+                                  self.y - sh_ * 0.35 - LIGHT_DY * throw * 0.16))
 
         # --- the figure is drawn at SS× into a scratch buffer and scaled down,
         # which anti-aliases the whole silhouette at once: no stair-stepping on
@@ -1813,13 +1840,36 @@ class Fighter:
             taper(buf, el, hd, 9 * u, 7 * u, col)
             pygame.draw.circle(buf, acc, (int(hd[0]), int(hd[1])), int(7 * u))
 
+        # Rim pass: the whole figure is drawn once offset toward the key light
+        # in a brightened colour, then the real figure covers it — what peeks
+        # out is an edge light along the lit side.
+        hr = 15 * u
+        rimf = CFG.light.rim
+        if rimf > 0:
+            rx = -LIGHT_DX * 2.6 * u * 0.5
+            ry = -LIGHT_DY * 2.6 * u * 0.5
+            rc = (min(255, int(CFG.light.color[0] * 0.55 + body[0] * 0.45)),
+                  min(255, int(CFG.light.color[1] * 0.55 + body[1] * 0.45)),
+                  min(255, int(CFG.light.color[2] * 0.55 + body[2] * 0.45)))
+            rc = shade(rc, 0.55 + rimf * 0.6)
+            off = lambda q: (q[0] + rx, q[1] + ry)
+            for tag in ("b", "f"):
+                taper(buf, off(hip), off(T(J["knee_" + tag])), 13.5 * u, 11 * u, rc)
+                taper(buf, off(T(J["knee_" + tag])), off(T(J["foot_" + tag])),
+                      11 * u, 8 * u, rc)
+                taper(buf, off(T(J["sh_" + tag])), off(T(J["elbow_" + tag])),
+                      10.5 * u, 9 * u, rc)
+                taper(buf, off(T(J["elbow_" + tag])), off(T(J["hand_" + tag])),
+                      9 * u, 7 * u, rc)
+            taper(buf, off(hip), off(neck), 17 * u, 15 * u, rc)
+            pygame.draw.circle(buf, rc, (int(head[0] + rx), int(head[1] + ry)), int(hr))
+
         leg("b", dark)
         arm("b", dark)
         taper(buf, hip, neck, 17 * u, 15 * u, body)                 # torso
         pygame.draw.circle(buf, acc, (int(hip[0]), int(hip[1])), int(8 * u))   # belt
         leg("f", lite)
 
-        hr = 15 * u
         pygame.draw.circle(buf, SKIN, (int(head[0]), int(head[1])), int(hr))
         cap = pygame.Rect(0, 0, int(hr * 2), int(hr))                # hair
         cap.center = (int(head[0] - fc * 1.5 * u), int(head[1] - hr * 0.46))
@@ -2130,6 +2180,85 @@ def shop(t):
         (W // 2, 684), F, GOLD, True)
 
 
+# --------------------------------------------------------------------------
+# PHASE E — lighting and the post chain
+#
+# Order is bloom -> grade -> vignette -> grain -> chroma. Bloom reads from a
+# separate emissive buffer rather than thresholding the frame: you cannot
+# threshold cheaply in pygame, and drawing the emitters twice is both cheaper
+# and more controllable than guessing which pixels were meant to be bright.
+# --------------------------------------------------------------------------
+LIGHT_DX = math.cos(math.radians(CFG.light.angle))
+LIGHT_DY = math.sin(math.radians(CFG.light.angle))
+
+EMIS = pygame.Surface((WW, WH)).convert()        # additive-only emitter buffer
+_bloom_a = pygame.Surface((W // 4, H // 4)).convert()
+_bloom_b = pygame.Surface((W // 8, H // 8)).convert()
+_bloom_up = pygame.Surface((W, H)).convert()   # reused; never reallocated
+_grade_mul = pygame.Surface((W, H)).convert()
+_grade_add = pygame.Surface((W, H)).convert()
+_grade_mul.fill(CFG.post.grade_gain)
+_grade_add.fill(CFG.post.grade_lift)
+UI_VIGNETTE = pygame.Surface((W, H), pygame.SRCALPHA)
+_d = 150
+for _i in range(_d):
+    _c = (0, 0, 0, int(96 * (1 - _i / _d) ** 2.2))
+    pygame.draw.line(UI_VIGNETTE, _c, (0, _i), (W, _i))
+    pygame.draw.line(UI_VIGNETTE, _c, (0, H - 1 - _i), (W, H - 1 - _i))
+    pygame.draw.line(UI_VIGNETTE, _c, (_i, 0), (_i, H))
+    pygame.draw.line(UI_VIGNETTE, _c, (W - 1 - _i, 0), (W - 1 - _i, H))
+
+# Grain is baked at its final intensity. set_alpha does nothing under
+# BLEND_RGB_ADD — the same trap as the glow surfaces — so the strength has to
+# live in the pixel values themselves.
+_grain = []
+_grain_amp = max(1, int(64 * CFG.post.grain))
+for _t in range(CFG.post.grain_tiles):
+    _g = pygame.Surface((W // 2, H // 2)).convert()
+    _rng = random.Random(900 + _t)
+    for _ in range(6000):
+        _v = _rng.randint(0, _grain_amp)
+        _g.set_at((_rng.randrange(W // 2), _rng.randrange(H // 2)), (_v, _v, _v))
+    _grain.append(pygame.transform.smoothscale(_g, (W, H)))
+_grain_i = [0]
+
+
+def emit(x, y, radius, color):
+    """Register a light source for the bloom pass."""
+    if CFG.post.enabled:
+        glow(x, y, radius, color, surf=EMIS)
+
+
+def post_process(dst):
+    """bloom -> grade -> vignette -> grain -> chroma, all intensity-gated."""
+    c = CFG.post
+    if not c.enabled:
+        return
+    if c.bloom > 0:
+        r = cam.view_rect()
+        r.width = min(r.width, EMIS.get_width() - r.x)
+        r.height = min(r.height, EMIS.get_height() - r.y)
+        pygame.transform.smoothscale(EMIS.subsurface(r), (W // 4, H // 4), _bloom_a)
+        pygame.transform.smoothscale(_bloom_a, (W // 8, H // 8), _bloom_b)
+        if c.bloom < 1.0:
+            # scale the 160x90 buffer, not the 1280x720 one
+            _bloom_b.fill((int(255 * c.bloom),) * 3, special_flags=pygame.BLEND_RGB_MULT)
+        pygame.transform.smoothscale(_bloom_b, (W, H), _bloom_up)
+        dst.blit(_bloom_up, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+    dst.blit(_grade_mul, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+    dst.blit(_grade_add, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+    if c.vignette:
+        dst.blit(UI_VIGNETTE, (0, 0))
+    if c.grain > 0:
+        _grain_i[0] = (_grain_i[0] + 1) % len(_grain)
+        dst.blit(_grain[_grain_i[0]], (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+    if c.chroma > 0:
+        cp = dst.copy()
+        off = max(1, int(c.chroma * 4))
+        dst.blit(cp, (off, 0), special_flags=pygame.BLEND_RGB_ADD)
+        dst.blit(cp, (-off, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+
 def result_overlay():
     """Drawn onto the UI over the camera's view of the arena."""
     ov = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -2255,6 +2384,8 @@ def update_world(dt):
 
 
 def draw_world(t):
+    if CFG.post.enabled:
+        EMIS.fill((0, 0, 0), cam.view_rect())   # only what bloom will sample
     arena(t)
     for z in zones:
         z.draw()
@@ -2407,6 +2538,7 @@ def frame(events, dt, t):
         draw_world(t)
         target(UI)
         cam.apply(WORLD, UI)
+        post_process(UI)
         hud()
         if state == "ko":
             ov = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -2420,6 +2552,7 @@ def frame(events, dt, t):
         arena_foreground()
         target(UI)
         cam.apply(WORLD, UI)
+        post_process(UI)
         result_overlay()
 
     if banner_t > 0 and state in ("fight", "ko"):
