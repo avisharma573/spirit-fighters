@@ -3,3 +3,4 @@ __pycache__/
 spirit_fighters_save.json
 .venv/
 venv/
+build/

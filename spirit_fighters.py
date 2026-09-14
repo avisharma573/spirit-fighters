@@ -12,14 +12,20 @@ Run:  python3 spirit_fighters.py
 Self-test (headless):  SF_SELFTEST=1 python3 spirit_fighters.py
 """
 
+import asyncio
 import os
 import json
 import math
 import random
+import sys
 import time
 from collections import deque
 
 import pygame
+
+# pygbag compiles this to WebAssembly; sys.platform is "emscripten" there.
+# The browser build skips or shrinks the expensive start-up work.
+WEB = sys.platform == "emscripten"
 
 # --------------------------------------------------------------------------
 # boot
@@ -188,7 +194,7 @@ CFG = Cfg(
         grade_lift=(5, 4, 9),         # add (shadows)
         vignette=True,
         grain=0.16,             # film grain opacity
-        grain_tiles=6,
+        grain_tiles=3 if WEB else 6,
         chroma=0.0,             # edge chromatic aberration; 0 = off
     ),
     fx=Cfg(                     # PHASE F — particles and weather
@@ -279,10 +285,11 @@ def _build_sounds():
 
     # Ambient bed: filtered noise that swells, plus a low wind drone. Looped
     # quietly under everything so the stadium is never silent.
-    n = int(rate * 6.0)
+    n = int(rate * (2.5 if WEB else 6.0))
     noise = np.random.uniform(-1, 1, n)
-    kernel = np.ones(700) / 700.0
-    crowd = np.convolve(noise, kernel, mode="same") * 6.0
+    taps = 160 if WEB else 700
+    kernel = np.ones(taps) / float(taps)
+    crowd = np.convolve(noise, kernel, mode="same") * (2.6 if WEB else 6.0)
     swell = 0.55 + 0.45 * np.sin(np.linspace(0, math.tau * 2.5, n))
     wind = np.sin(2 * np.pi * np.cumsum(np.full(n, 42.0)) / rate) * 0.10
     bed = np.clip(crowd * swell + wind, -1, 1) * 0.5
@@ -296,6 +303,11 @@ def _build_sounds():
 
 AUDIO_ERROR = None
 try:
+    if WEB:
+        # numpy is the single heaviest WebAssembly package and it is used for
+        # nothing but synthesising audio. Browsers also gate sound behind a
+        # user gesture, so the web build runs silent and loads far faster.
+        raise RuntimeError("audio synthesis skipped in the browser build")
     _build_sounds()
 except Exception as _exc:          # never fatal, but never silent either
     SND.clear()
@@ -2834,7 +2846,12 @@ def debug_overlay():
         txt(line, (20, 104 + i * 18), SM, col, surf=UI)
 
 
-def main():
+async def main():
+    """Async so the same loop runs natively and in the browser.
+
+    Under pygbag the `await` is what hands control back to the browser's event
+    loop each frame; natively asyncio.run just drives it straight through.
+    """
     running = True
     while running:
         dt = min(clock.tick(60) / 1000.0, 0.05)
@@ -2848,6 +2865,7 @@ def main():
         display.blit(UI, (0, 0))
         pygame.display.flip()
         frame_ms.append((time.perf_counter() - t0) * 1000.0)
+        await asyncio.sleep(0)
     pygame.quit()
 
 
@@ -2955,4 +2973,4 @@ if __name__ == "__main__":
         selftest()
         pygame.quit()
     else:
-        main()
+        asyncio.run(main())
