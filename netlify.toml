@@ -1,0 +1,13 @@
+# pygbag's WebAssembly loader wants a cross-origin-isolated context
+# (SharedArrayBuffer). GitHub Pages cannot set custom headers; Netlify can,
+# which is why the browser build is served from here.
+[build]
+  publish = "build/web"
+  command = "python3 -m pip install pygbag && python3 -m pygbag --build --ume_block 0 ."
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+    Cross-Origin-Resource-Policy = "cross-origin"

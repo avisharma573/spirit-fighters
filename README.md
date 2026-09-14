@@ -18,6 +18,25 @@ python3 spirit_fighters.py
 
 `numpy` is optional; without it the game runs silently.
 
+### Browser build (experimental)
+
+The game also compiles to WebAssembly with [pygbag](https://pypi.org/project/pygbag/):
+
+```bash
+pip install pygbag
+python3 -m pygbag --build --ume_block 0 .
+```
+
+Output lands in `build/web` as static files. **This is not yet confirmed
+working** — the bundle builds and deploys, but the pygbag loader has not been
+seen to finish booting, and even once it does, this renderer is heavy (a
+1600x900 world, six parallax layers, a supersampled figure pass and a
+multi-stage post chain) so a browser may not hold 60fps. The desktop build is
+the one to rely on.
+
+pygbag's loader wants a cross-origin-isolated context, which GitHub Pages
+cannot provide; `netlify.toml` sets the required COOP/COEP headers.
+
 ### Controls
 
 | Key | Action |
