@@ -73,7 +73,7 @@ XL = pygame.font.SysFont("arial", 96, 1)
 
 WHITE = (245, 247, 250); BLACK = (5, 7, 10);    GOLD = (255, 200, 65)
 GREEN = (70, 220, 125);  RED = (235, 60, 75);   CYAN = (65, 220, 240)
-BLUE = (65, 125, 235);   GREY = (80, 92, 108);  DIM = (150, 165, 182)
+DIM = (150, 165, 182)
 SKIN = (226, 190, 162)
 
 # --------------------------------------------------------------------------
@@ -92,11 +92,19 @@ class Cfg(dict):
 CFG = Cfg(
     game=Cfg(
         dev_mode=True,          # every shop item is free while the game is unreleased
-        round_time=90.0,        # seconds before the match goes to a decision
+        round_time=75.0,        # seconds before the match goes to a decision
         intro_time=1.3,         # "FIGHT!" hold before the AI engages
         ko_time=1.5,            # slow-motion hold after a knockout
         ko_timescale=0.30,      # how slowly that hold runs
         hitstop_timescale=0.25,  # time dilation during an impact freeze
+        dash_iframes=0.22,      # brief invulnerability through a dash — the
+                                # only defensive tool a speed spirit has
+        shield_mult=0.66,       # damage taken while shielded (was 0.45,
+                                # which made the two shield spirits unbeatable)
+        ai_skill=1.0,           # 0.55 easy .. 1.0 normal .. 1.5 hard
+        ai_names=("EASY", "NORMAL", "HARD"),
+        ai_levels=(0.55, 1.0, 1.5),
+        ai_level=1,
     ),
     arena=Cfg(
         ground_top=456,         # nearest / furthest the feet may stand
@@ -340,41 +348,41 @@ def stop_ambient():
 #   ability: (name, cooldown, damage, kind)
 # --------------------------------------------------------------------------
 SP = {
-    "Earth": ("TANK / CONTROL", (108, 78, 48), (225, 175, 80), 340, 205, [
+    "Earth": ("TANK / CONTROL", (108, 78, 48), (225, 175, 80), 570, 205, [
         ("Rock Punch", 1.5, 22, "melee"), ("Stone Throw", 2.2, 28, "shot"),
         ("Stone Shield", 3.5, 0, "shield"), ("Earthquake", 4.2, 35, "area"),
     ], ("Earth Titan", 80)),
-    "Fire": ("ASSAULT / DOT", (150, 44, 26), (255, 140, 45), 250, 245, [
+    "Fire": ("ASSAULT / DOT", (150, 44, 26), (255, 140, 45), 520, 245, [
         ("Fire Punch", 1.2, 24, "melee"), ("Fireball", 1.8, 30, "shot"),
         ("Flame Dash", 2.4, 32, "dash"), ("Burning Ground", 3.5, 18, "area"),
     ], ("Inferno", 24)),
-    "Police": ("CONTROL / DISABLE", (30, 62, 130), (80, 190, 255), 270, 250, [
+    "Police": ("CONTROL / DISABLE", (30, 62, 130), (80, 190, 255), 545, 250, [
         ("Baton Strike", 1.2, 23, "melee"), ("Taser", 1.9, 20, "stun"),
         ("Handcuff Trap", 3.0, 15, "root"), ("Arrest", 4.2, 28, "arrest"),
     ], ("SWAT Raid", 78)),
-    "Gambler": ("TRICKSTER / RNG", (108, 34, 120), (255, 210, 70), 245, 250, [
+    "Gambler": ("TRICKSTER / RNG", (108, 34, 120), (255, 210, 70), 515, 250, [
         ("Lucky Punch", 1.1, 20, "melee"), ("Dice Blast", 1.7, 25, "random"),
         ("Jackpot", 3.0, 45, "random"), ("Risky Roll", 2.5, 0, "buff"),
     ], ("House Always Wins", 90)),
-    "Arch Angel": ("MYTHIC / HYBRID", (196, 158, 58), (255, 245, 170), 285, 265, [
+    "Arch Angel": ("MYTHIC / HYBRID", (196, 158, 58), (255, 245, 170), 560, 265, [
         ("Light Blade", 1.2, 25, "melee"), ("Light Dash", 2.0, 32, "dash"),
         ("Holy Shield", 3.2, 0, "shield"), ("Healing Light", 3.0, 25, "heal"),
     ], ("Divine Judgment", 95)),
-    "Demonic": ("ASSASSIN / LIFESTEAL", (82, 20, 100), (240, 45, 105), 255, 275, [
+    "Demonic": ("ASSASSIN / LIFESTEAL", (82, 20, 100), (240, 45, 105), 525, 275, [
         ("Demon Claw", 1.0, 26, "melee"), ("Soul Shot", 1.7, 28, "shot"),
         ("Demon Flight", 2.6, 0, "buff"), ("Soul Steal", 3.5, 38, "life"),
     ], ("Demon Rage", 88)),
-    "Archer": ("RANGED / PRECISION", (28, 108, 58), (120, 240, 120), 235, 235, [
+    "Archer": ("RANGED / PRECISION", (28, 108, 58), (120, 240, 120), 500, 235, [
         ("Quick Shot", 0.9, 20, "shot"), ("Triple Arrow", 2.1, 34, "triple"),
         ("Piercing Arrow", 2.7, 40, "shot"), ("Explosive Arrow", 3.4, 32, "area"),
     ], ("Rain of Arrows", 20)),
-    "Healer": ("SUPPORT / SUSTAIN", (34, 150, 96), (150, 255, 205), 245, 225, [
-        ("Staff Strike", 1.2, 18, "melee"), ("Heal Pulse", 2.3, 28, "heal"),
-        ("Healing Zone", 3.3, 16, "hzone"), ("Regeneration", 4.0, 45, "regen"),
+    "Healer": ("SUPPORT / SUSTAIN", (34, 150, 96), (150, 255, 205), 520, 225, [
+        ("Staff Strike", 1.2, 18, "melee"), ("Heal Pulse", 2.6, 20, "heal"),
+        ("Healing Zone", 3.6, 11, "hzone"), ("Regeneration", 4.4, 30, "regen"),
     ], ("Full Restore", 90)),
-    "Racer": ("SPEED / HIT & RUN", (24, 118, 190), (80, 235, 255), 230, 310, [
+    "Racer": ("SPEED / HIT & RUN", (24, 118, 190), (80, 235, 255), 530, 310, [
         ("Turbo Punch", 1.0, 22, "melee"), ("Turbo Dash", 1.6, 30, "dash"),
-        ("Spin Attack", 2.3, 32, "spin"), ("Nitro Strike", 3.2, 42, "dash"),
+        ("Spin Attack", 2.1, 36, "spin"), ("Nitro Strike", 3.2, 42, "dash"),
     ], ("Sonic Speed", 80)),
 }
 names = list(SP)
@@ -510,14 +518,6 @@ def glow(x, y, radius, color, surf=None):
     # into the bloom buffer. Explicit `surf=` callers are baking, not emitting.
     if surf is None and screen is WORLD and CFG.post.enabled:
         EMIS.blit(g, (x - r, y - r), special_flags=pygame.BLEND_RGBA_ADD)
-
-
-def limb(a, b, w, col, surf=None):
-    """A rounded capsule — the trick that makes stick limbs read as bodies."""
-    surf = surf or screen
-    pygame.draw.line(surf, col, a, b, w)
-    pygame.draw.circle(surf, col, ipt(a), w // 2)
-    pygame.draw.circle(surf, col, ipt(b), w // 2)
 
 
 def taper(surf, a, b, w1, w2, col):
@@ -1139,10 +1139,6 @@ class Camera:
         r.height = min(r.height, src.get_height() - r.y)
         pygame.transform.smoothscale(src.subsurface(r), (W, H), dst)
 
-    def to_screen(self, wx, wy):
-        r = self.view_rect()
-        return ((wx - r.x) * W / r.width, (wy - r.y) * H / r.height)
-
 
 cam = Camera()
 
@@ -1544,7 +1540,7 @@ class Fighter:
         self.stun = 0.0; self.root = 0.0; self.shield = 0.0; self.buff = 0.0
         self.alive = True; self.attack_landed = False
         self.combo = 0; self.combo_t = 0.0
-        self.hitstop = 0.0; self.flinch = 0.0
+        self.hitstop = 0.0; self.flinch = 0.0; self.iframe = 0.0
         self.moving = False; self.px = self.x; self.py = self.y
         self.vx = 0.0; self.vy = 0.0                     # measured, drives lean + stride
         self.mvx = 0.0; self.mvy = 0.0                   # locomotion velocity
@@ -1565,8 +1561,12 @@ class Fighter:
     def hit(self, damage):
         if not self.alive:
             return
+        if self.iframe > 0:                 # dashed through it
+            floaters.append(FloatingText(self.x, self.y - 130, "DODGE", CYAN, S))
+            burst(self.x, self.y - 80, CYAN, 6, 90, 3, grav=-60)
+            return
         if self.shield > 0:
-            damage *= 0.45
+            damage *= CFG.game.shield_mult
         damage *= self.armor
         self.hp = max(0.0, self.hp - damage)
         self.ult = min(100.0, self.ult + damage * 0.12)
@@ -1691,7 +1691,7 @@ class Fighter:
         reach = ks(96 if self.atype == "punch" else 124) * self.scale() / KS
         if -ks(22) < front < reach and abs(dy) < ks(46):
             self.attack_landed = True
-            base = 13 if self.atype == "punch" else 18
+            base = 11 if self.atype == "punch" else 15
             if self.combo_t > 0:
                 base *= 1 + min(0.35, self.combo * 0.07)
             self.deal(t, base)
@@ -1784,11 +1784,11 @@ class Fighter:
         elif k == "random":
             r = random.randint(1, 6)
             floaters.append(FloatingText(self.x, self.y - 175, f"ROLL {r}", GOLD, M))
-            if r >= 3:
+            if r >= 2:
                 self.deal(t, damage * r / 3.0, True)
                 t.knock(self.facing, 12)
             else:
-                self.hit(12)
+                self.hit(6)
                 floaters.append(FloatingText(self.x, self.y - 150, "BUST", RED, S))
         elif k == "buff":
             self.buff = 4.5
@@ -1797,7 +1797,17 @@ class Fighter:
 
     def dash(self, t, damage, length):
         ox, oy = self.x, self.y
-        self.x = max(MARGIN_X, min(W - MARGIN_X, self.x + self.facing * length))
+        dest = self.x + self.facing * length
+        # Pull up just short of the opponent rather than sliding past them and
+        # having to turn around. A dash should close distance and strike.
+        self.iframe = CFG.game.dash_iframes
+        gap = (t.x - self.x) * self.facing
+        if 0 < gap < length:
+            dest = self.x + self.facing * max(0.0, gap - ks(62))
+        # WW, not W: clamping to the window width stopped rightward dashes at
+        # x=1130 in a world that runs to 1450 — short of where the opponent
+        # even starts, which crippled every dash-based spirit.
+        self.x = max(MARGIN_X, min(WW - MARGIN_X, dest))
         for i in range(12):                                    # after-image trail
             f = i / 12
             spawn(ox + (self.x - ox) * f, oy - 80 + random.uniform(-22, 22),
@@ -1896,6 +1906,7 @@ class Fighter:
                 self.buffer = None
 
         self.hitstop = max(0.0, self.hitstop - dt)
+        self.iframe = max(0.0, self.iframe - dt)
         self.flinch = max(0.0, self.flinch - dt)
         self.atk = max(0.0, self.atk - dt)
         self.stun = max(0.0, self.stun - dt)
@@ -2134,33 +2145,43 @@ def hud():
 
 
 def draw_stickman(cx, cy, c, t, scale=1.0):
-    """Menu mannequin — same construction as the in-game fighter."""
+    """Menu mannequin. Proportions come from CFG.motion so the fighter you pick
+    looks like the fighter you get."""
+    m = CFG.motion
     s = scale
-    b = math.sin(t * 2.2) * 3
-    hip = (cx, cy + 28 * s)
-    neck = (cx, cy - 30 * s + b)
-    head = (cx, cy - 54 * s + b)
-    for sign, col in ((-1, shade(c, 0.55)), (1, shade(c, 1.0))):
-        foot = (cx + sign * 26 * s, cy + 88 * s)
-        knee = ((hip[0] + foot[0]) / 2 + sign * 6 * s, (hip[1] + foot[1]) / 2)
-        limb(hip, knee, int(13 * s), col); limb(knee, foot, int(13 * s), col)
-        pygame.draw.circle(screen, c, ipt(foot), int(8 * s))
-    limb(hip, neck, int(18 * s), shade(c, 1.0))
-    for sign, col in ((-1, shade(c, 0.55)), (1, shade(c, 1.35))):
-        hand = (cx + sign * 34 * s, cy - 34 * s + b + sign * 4)
-        sh = (cx + sign * 9 * s, cy - 22 * s + b)
-        elbow = ((sh[0] + hand[0]) / 2 + sign * 6 * s, (sh[1] + hand[1]) / 2 + 8 * s)
-        limb(sh, elbow, int(11 * s), col); limb(elbow, hand, int(10 * s), col)
-        pygame.draw.circle(screen, c, ipt(hand), int(8 * s))
-    pygame.draw.circle(screen, SKIN, ipt(head), int(20 * s))
-    pygame.draw.circle(screen, shade(SKIN, 0.6), ipt(head), int(20 * s), 2)
-    cap = pygame.Rect(0, 0, int(40 * s), int(20 * s))
-    cap.center = (head[0], head[1] - 9 * s)
-    pygame.draw.ellipse(screen, shade(c, 0.55), cap)
-    orb = (cx, cy - 104 * s + b * 1.5)
-    glow(orb[0], orb[1], int(26 * s), shade(c, 0.7))
-    pygame.draw.circle(screen, c, ipt(orb), int(11 * s))
-    pygame.draw.circle(screen, WHITE, ipt((orb[0] - 3.5, orb[1] - 3.5)), int(4 * s))
+    bob = math.sin(t * 2.2) * 3
+    dark, lite, body = shade(c, 0.55), shade(c, 1.35), shade(c, 1.0)
+    ground = cy + m.hip_h * s
+    hip = (cx, ground - m.hip_h * s + bob * 0.3)
+    neck = (cx, ground - m.chest_h * s + bob)
+    head = (cx, ground - m.head_h * s + bob)
+    thigh, shin = m.thigh * s, m.shin * s
+    ua, fa = m.upper_arm * s, m.forearm * s
+
+    for sign, col in ((-1, dark), (1, lite)):
+        foot = (cx + sign * m.stance_width * s * 1.15, ground)
+        knee, end = ik2_dir(hip, foot, thigh, shin, sign, 0.30)
+        taper(screen, hip, knee, 13.5 * s, 11 * s, col)
+        taper(screen, knee, end, 11 * s, 8 * s, col)
+        pygame.draw.circle(screen, c, ipt(end), int(6.5 * s))
+    taper(screen, hip, neck, 17 * s, 15 * s, body)
+    pygame.draw.circle(screen, c, ipt(hip), int(8 * s))
+    for sign, col in ((-1, dark), (1, lite)):
+        sh = (neck[0] + sign * m.shoulder_w * s, neck[1] + 7 * s)
+        hand = (sh[0] + sign * 27 * s, sh[1] - 15 * s - bob * 0.4)
+        elbow, end = ik2_dir(sh, hand, ua, fa, sign * 0.25, 1.0)
+        taper(screen, sh, elbow, 10.5 * s, 9 * s, col)
+        taper(screen, elbow, end, 9 * s, 7 * s, col)
+        pygame.draw.circle(screen, c, ipt(end), int(7 * s))
+    hr = int(15 * s)
+    pygame.draw.circle(screen, SKIN, ipt(head), hr)
+    cap = pygame.Rect(0, 0, hr * 2, hr)
+    cap.center = (int(head[0]), int(head[1] - hr * 0.46))
+    pygame.draw.ellipse(screen, dark, cap)
+    orb = (cx, ground - 196 * s + bob)
+    glow(orb[0], orb[1], int(20 * s), c)
+    pygame.draw.circle(screen, c, ipt(orb), int(8 * s))
+    pygame.draw.circle(screen, WHITE, ipt((orb[0] - 2.5 * s, orb[1] - 2.5 * s)), int(3 * s))
 
 
 def menu(t):
@@ -2186,14 +2207,17 @@ def menu(t):
     pygame.draw.rect(screen, (11, 17, 27), (52, 146, 452, 440), border_radius=12)
     pygame.draw.rect(screen, (36, 48, 64), (52, 146, 452, 440), 2, border_radius=12)
     cone = pygame.Surface((448, 436), pygame.SRCALPHA)          # spotlight beam
-    pygame.draw.polygon(cone, (acc[0], acc[1], acc[2], 13),
+    # Premultiplied: BLEND_RGBA_ADD ignores source alpha, so the intensity has
+    # to be in the RGB. An alpha of 13 here rendered as a solid wedge.
+    beam_col = shade(acc, 0.055)
+    pygame.draw.polygon(cone, (beam_col[0], beam_col[1], beam_col[2], 255),
                         [(198, 0), (250, 0), (392, 436), (56, 436)])
     screen.blit(cone, (54, 148), special_flags=pygame.BLEND_RGBA_ADD)
     ped = pygame.Rect(0, 0, 250, 46)
     ped.center = (278, 530)
     pygame.draw.ellipse(screen, (18, 26, 38), ped)
     pygame.draw.ellipse(screen, shade(acc, 0.55), ped, 2)
-    draw_stickman(278, 418, acc, t, 1.18)
+    draw_stickman(278, 372, acc, t, 1.30)
 
     # --- right: dossier
     RX = 548
@@ -2232,9 +2256,13 @@ def menu(t):
         txt(nm, (x + 12, 614), S, WHITE if sel else (130, 142, 156), True)
 
     eq = len(equipped)
-    txt(f"LOADOUT: {eq} item{'s' if eq != 1 else ''} equipped", (W // 2, 660), S,
+    lvl = CFG.game.ai_names[CFG.game.ai_level]
+    lcol = (GREEN, GOLD, RED)[CFG.game.ai_level]
+    txt(f"LOADOUT: {eq} item{'s' if eq != 1 else ''} equipped", (W // 2 - 130, 660), S,
         GREEN if eq else DIM, True)
-    txt("A/D or ←/→ SELECT      ENTER FIGHT      S SHOP      ESC QUIT",
+    txt("DIFFICULTY:", (W // 2 + 60, 660), S, DIM, True)
+    txt(lvl, (W // 2 + 152, 660), S, lcol, True)
+    txt("A/D SELECT    ENTER FIGHT    S SHOP    F DIFFICULTY    ESC QUIT",
         (W // 2, 692), F, GOLD, True)
 
 
@@ -2358,12 +2386,6 @@ for _t in range(CFG.post.grain_tiles):
 _grain_i = [0]
 
 
-def emit(x, y, radius, color):
-    """Register a light source for the bloom pass."""
-    if CFG.post.enabled:
-        glow(x, y, radius, color, surf=EMIS)
-
-
 def post_process(dst):
     """bloom -> grade -> vignette -> grain -> chroma, all intensity-gated."""
     c = CFG.post
@@ -2471,13 +2493,14 @@ def ai(dt):
     if abs(dx) > 2:
         e.facing = 1 if dx > 0 else -1
 
-    if q < ks(140) and random.random() < dt * 1.5:
+    sk = CFG.game.ai_skill
+    if q < ks(140) and random.random() < dt * 1.5 * sk:
         e.attack(p, "punch" if random.random() < 0.62 else "kick")
     for i in range(4):
-        if e.cd[i] <= 0 and random.random() < dt * 0.45:
+        if e.cd[i] <= 0 and random.random() < dt * 0.45 * sk:
             e.ability(i, p)
             break
-    if e.ult >= 100 and random.random() < dt * 0.5:
+    if e.ult >= 100 and random.random() < dt * 0.5 * sk:
         e.special(p)
 
 
@@ -2632,6 +2655,11 @@ def frame(events, dt, t):
                     start()
                 elif ev.key == pygame.K_s:
                     state = "shop"; sfx("ui")
+                elif ev.key == pygame.K_f:
+                    lv = (CFG.game.ai_level + 1) % len(CFG.game.ai_levels)
+                    CFG.game.ai_level = lv
+                    CFG.game.ai_skill = CFG.game.ai_levels[lv]
+                    sfx("equip")
                 elif ev.key == pygame.K_ESCAPE:
                     running = False
             elif state == "shop":
@@ -2732,6 +2760,10 @@ def frame(events, dt, t):
                 finish()
         cam.update(dt, p, e)
 
+    if state == "result":
+        update_particles(dt)      # rain keeps falling; a frozen sky reads as a bug
+        spawn_weather()
+
     # ---- draw
     if state == "menu":
         target(UI)
@@ -2752,6 +2784,8 @@ def frame(events, dt, t):
             UI.blit(ov, (0, 0))
     else:
         target(WORLD)
+        if CFG.post.enabled:
+            EMIS.fill((0, 0, 0), cam.view_rect())   # else bloom accumulates
         arena(t)
         for fighter in sorted((p, e), key=lambda z: z.y):
             fighter.draw()
