@@ -183,6 +183,25 @@ CFG = Cfg(
         grain_tiles=6,
         chroma=0.0,             # edge chromatic aberration; 0 = off
     ),
+    fx=Cfg(                     # PHASE F — particles and weather
+        pool=1400,              # hard cap; particles are recycled, never allocated
+        dust_per_step=7,        # puff kicked up by a footfall
+        debris_per_hit=9,
+        ambient=70,             # drifting motes, split across two depths
+        ambient_rate=0.5,
+        weather="rain",         # "rain" | "snow" | "none"
+        weather_count=260,
+        rain_speed=1250.0,
+        rain_len=26.0,
+        splash_chance=0.30,
+    ),
+    audio=Cfg(                  # PHASE G
+        enabled=True,
+        master=0.85,
+        variants=5,             # pitch-shifted copies baked per sound
+        pitch_spread=0.13,      # +/- fraction of playback rate
+        ambient=0.34,           # crowd + wind bed
+    ),
     debug=Cfg(
         overlay=False,          # F3 toggles the frame-time readout
         samples=90,             # rolling window for the ms/frame average
@@ -197,6 +216,8 @@ SND = {}
 
 
 def _build_sounds():
+    """Synthesise every sound at boot. Each gets several pitch variants so a
+    repeated hit never sounds like the same sample twice."""
     import numpy as np
     if pygame.mixer.get_init() is None:
         pygame.mixer.init(44100, -16, 1, 512)
@@ -204,7 +225,7 @@ def _build_sounds():
 
     def bake(samples, vol):
         a = np.clip(samples, -1.0, 1.0) * vol
-        return pygame.sndarray.make_sound((a * 32767).astype(np.int16))
+        return (a * 32767).astype(np.int16)
 
     def env(n, attack=0.004, power=2.2):
         t = np.linspace(0.0, 1.0, n, False)
@@ -213,41 +234,104 @@ def _build_sounds():
 
     def tone(freq_a, freq_b, dur, noise=0.0, power=2.2, vol=0.25):
         n = int(rate * dur)
-        t = np.linspace(0.0, dur, n, False)
         f = np.linspace(freq_a, freq_b, n)
         wave = np.sin(2 * np.pi * np.cumsum(f) / rate)
         if noise:
             wave = wave * (1 - noise) + np.random.uniform(-1, 1, n) * noise
         return bake(wave * env(n, power=power), vol)
 
-    SND["punch"] = tone(190, 70, 0.16, noise=0.55, vol=0.30)
-    SND["kick"] = tone(150, 48, 0.24, noise=0.45, vol=0.34)
-    SND["whoosh"] = tone(900, 260, 0.16, noise=0.80, power=1.4, vol=0.13)
-    SND["hit"] = tone(420, 120, 0.13, noise=0.35, vol=0.22)
-    SND["cast"] = tone(300, 880, 0.22, noise=0.05, power=1.6, vol=0.18)
-    SND["shot"] = tone(760, 300, 0.14, noise=0.15, vol=0.16)
-    SND["boom"] = tone(130, 40, 0.45, noise=0.70, power=1.6, vol=0.36)
-    SND["ult"] = tone(180, 1100, 0.70, noise=0.10, power=1.1, vol=0.32)
-    SND["heal"] = tone(520, 980, 0.30, noise=0.0, power=1.6, vol=0.16)
-    SND["ko"] = tone(320, 60, 0.80, noise=0.25, power=1.2, vol=0.34)
-    SND["ui"] = tone(700, 700, 0.05, noise=0.0, power=3.0, vol=0.12)
-    SND["equip"] = tone(520, 1040, 0.14, noise=0.0, power=2.0, vol=0.16)
+    def variants(arr):
+        """Resample to a few pitches; playing a random one kills the loop feel."""
+        out = []
+        nv = max(1, CFG.audio.variants)
+        for i in range(nv):
+            r = 1.0 + CFG.audio.pitch_spread * ((i / max(1, nv - 1)) * 2 - 1)
+            n = max(8, int(len(arr) / r))
+            idx = np.clip((np.arange(n) * r).astype(np.int32), 0, len(arr) - 1)
+            out.append(pygame.sndarray.make_sound(np.ascontiguousarray(arr[idx])))
+        return out
+
+    spec = {
+        "punch": tone(190, 70, 0.16, noise=0.55, vol=0.30),
+        "kick": tone(150, 48, 0.24, noise=0.45, vol=0.34),
+        "whoosh": tone(900, 260, 0.16, noise=0.80, power=1.4, vol=0.13),
+        "hit": tone(420, 120, 0.13, noise=0.35, vol=0.22),
+        "cast": tone(300, 880, 0.22, noise=0.05, power=1.6, vol=0.18),
+        "shot": tone(760, 300, 0.14, noise=0.15, vol=0.16),
+        "boom": tone(130, 40, 0.45, noise=0.70, power=1.6, vol=0.36),
+        "ult": tone(180, 1100, 0.70, noise=0.10, power=1.1, vol=0.32),
+        "heal": tone(520, 980, 0.30, noise=0.0, power=1.6, vol=0.16),
+        "ko": tone(320, 60, 0.80, noise=0.25, power=1.2, vol=0.34),
+        "ui": tone(700, 700, 0.05, noise=0.0, power=3.0, vol=0.12),
+        "equip": tone(520, 1040, 0.14, noise=0.0, power=2.0, vol=0.16),
+        "step": tone(240, 90, 0.09, noise=0.85, power=3.0, vol=0.16),
+    }
+    for name, arr in spec.items():
+        SND[name] = variants(arr)
+
+    # Ambient bed: filtered noise that swells, plus a low wind drone. Looped
+    # quietly under everything so the stadium is never silent.
+    n = int(rate * 6.0)
+    noise = np.random.uniform(-1, 1, n)
+    kernel = np.ones(700) / 700.0
+    crowd = np.convolve(noise, kernel, mode="same") * 6.0
+    swell = 0.55 + 0.45 * np.sin(np.linspace(0, math.tau * 2.5, n))
+    wind = np.sin(2 * np.pi * np.cumsum(np.full(n, 42.0)) / rate) * 0.10
+    bed = np.clip(crowd * swell + wind, -1, 1) * 0.5
+    fade = int(rate * 0.5)
+    ramp = np.ones(n)
+    ramp[:fade] = np.linspace(0, 1, fade)
+    ramp[-fade:] = np.linspace(1, 0, fade)
+    SND["_bed"] = [pygame.sndarray.make_sound(
+        np.ascontiguousarray((bed * ramp * 32767).astype(np.int16)))]
 
 
+AUDIO_ERROR = None
 try:
     _build_sounds()
-except Exception:
-    SND = {}
+except Exception as _exc:          # never fatal, but never silent either
+    SND.clear()
+    AUDIO_ERROR = repr(_exc)
 
 
 def sfx(name, vol=1.0):
-    s = SND.get(name)
-    if s:
-        try:
-            s.set_volume(vol)
-            s.play()
-        except Exception:
-            pass
+    """Play a random pitch variant at a slightly random volume."""
+    if not CFG.audio.enabled:
+        return
+    group = SND.get(name)
+    if not group:
+        return
+    try:
+        snd = group[random.randrange(len(group))]
+        snd.set_volume(max(0.0, min(1.0, vol * CFG.audio.master
+                                    * random.uniform(0.82, 1.0))))
+        snd.play()
+    except Exception:
+        pass
+
+
+_bed_chan = [None]
+
+
+def start_ambient():
+    if not CFG.audio.enabled or "_bed" not in SND:
+        return
+    try:
+        if _bed_chan[0] is None or not _bed_chan[0].get_busy():
+            _bed_chan[0] = SND["_bed"][0].play(loops=-1)
+        if _bed_chan[0]:
+            _bed_chan[0].set_volume(CFG.audio.ambient * CFG.audio.master)
+    except Exception:
+        pass
+
+
+def stop_ambient():
+    try:
+        if _bed_chan[0]:
+            _bed_chan[0].fadeout(400)
+            _bed_chan[0] = None
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -361,7 +445,7 @@ load_save()
 # --------------------------------------------------------------------------
 # global state
 # --------------------------------------------------------------------------
-particles = []; shots = []; zones = []; floaters = []
+shots = []; zones = []; floaters = []
 state = "menu"; pick = 0; p = e = None; result = ""
 timer = CFG.game.round_time; intro = 0.0; ko_timer = 0.0
 shop_sel = 0
@@ -463,22 +547,68 @@ def shade(col, f):
             max(0, min(255, int(col[2] * f))))
 
 
+# --------------------------------------------------------------------------
+# PHASE F — pooled particles
+#
+# Every particle lives in a fixed-size ring of preallocated slots. The old list
+# allocated a fresh list per particle and removed by value (O(n) per removal,
+# O(n^2) per frame); this allocates nothing per frame and compacts in one pass.
+# Slot layout: x y vx vy life maxlife r g b size grav drag kind
+# --------------------------------------------------------------------------
+P_X, P_Y, P_VX, P_VY, P_LIFE, P_MAX, P_R, P_G, P_B, P_SZ, P_GRAV, P_DRAG, P_KIND = range(13)
+K_SPARK, K_SMOKE, K_DUST, K_RAIN, K_MOTE = range(5)
+
+particles = [[0.0] * 13 for _ in range(CFG.fx.pool)]
+_p_live = [0]                     # particles occupy slots [0, _p_live)
+
+
+def spawn(x, y, vx, vy, life, col, size, grav=520.0, drag=1.4, kind=K_SPARK):
+    n = _p_live[0]
+    if n >= CFG.fx.pool:
+        return None
+    a = particles[n]
+    _p_live[0] = n + 1
+    a[P_X] = x; a[P_Y] = y; a[P_VX] = vx; a[P_VY] = vy
+    a[P_LIFE] = life; a[P_MAX] = life
+    a[P_R], a[P_G], a[P_B] = col[0], col[1], col[2]
+    a[P_SZ] = size; a[P_GRAV] = grav; a[P_DRAG] = drag; a[P_KIND] = kind
+    return a
+
+
 def burst(x, y, c, n=15, power=180, size=5, grav=520, life=0.55):
     for _ in range(n):
-        a = random.random() * math.tau
+        ang = random.random() * math.tau
         v = random.uniform(power * 0.25, power)
-        lf = life * (0.5 + random.random() * 0.8)
-        particles.append([x, y, math.cos(a) * v, math.sin(a) * v, lf, lf,
-                          c, size * (0.55 + random.random() * 0.7), grav])
+        spawn(x, y, math.cos(ang) * v, math.sin(ang) * v,
+              life * (0.5 + random.random() * 0.8), c,
+              size * (0.55 + random.random() * 0.7), grav)
 
 
 def smoke(x, y, c, n=8, power=60):
     for _ in range(n):
-        a = random.random() * math.tau
+        ang = random.random() * math.tau
         v = random.uniform(10, power)
-        lf = 0.7 + random.random() * 0.7
-        particles.append([x, y, math.cos(a) * v, math.sin(a) * v - 30, lf, lf,
-                          c, 7 + random.random() * 6, -40])
+        spawn(x, y, math.cos(ang) * v, math.sin(ang) * v - 30,
+              0.7 + random.random() * 0.7, c, 7 + random.random() * 6,
+              -40, 1.1, K_SMOKE)
+
+
+def dust(x, y, scale=1.0):
+    """Kicked up by a footfall. Surface-tinted, low and slow."""
+    for _ in range(CFG.fx.dust_per_step):
+        ang = -math.pi * 0.5 + random.uniform(-1.1, 1.1)
+        v = random.uniform(18, 62) * scale
+        spawn(x + random.uniform(-6, 6), y, math.cos(ang) * v, math.sin(ang) * v * 0.5,
+              0.34 + random.random() * 0.30, (92, 104, 86),
+              (4 + random.random() * 5) * scale, -22.0, 2.4, K_DUST)
+
+
+def debris(x, y, c, direction=0.0):
+    for _ in range(CFG.fx.debris_per_hit):
+        ang = random.random() * math.tau
+        v = random.uniform(90, 300)
+        spawn(x, y, math.cos(ang) * v + direction * 120, math.sin(ang) * v - 40,
+              0.30 + random.random() * 0.45, c, 2 + random.random() * 3, 900.0)
 
 
 def add_shake(v):
@@ -927,8 +1057,8 @@ class Zone:
         if random.random() < dt * 22 and self.life > 0:
             a = random.random() * math.tau
             rr = self.r * math.sqrt(random.random())
-            particles.append([self.x + math.cos(a) * rr, self.y + math.sin(a) * rr * 0.45,
-                              0, -random.uniform(20, 60), 0.6, 0.6, self.c, 4, -60])
+            spawn(self.x + math.cos(a) * rr, self.y + math.sin(a) * rr * 0.45,
+                  0, -random.uniform(20, 60), 0.6, self.c, 4, -60.0)
 
     def _ellipse(self, r, width, col):
         rect = pygame.Rect(0, 0, int(r * 2), int(r * 0.9))
@@ -1572,6 +1702,7 @@ class Fighter:
             hx = self.x + self.facing * reach * 0.8
             hy = self.y - (100 if self.atype == "punch" else 70) * self.scale()
             burst(hx, hy, self.b, 14, 160, 5)
+            debris(hx, hy, self.b, self.facing)
             glow(hx, hy, 40, self.b)
             add_shake(3 if self.atype == "punch" else 5)
             sfx("punch" if self.atype == "punch" else "kick", 0.8)
@@ -1615,8 +1746,8 @@ class Fighter:
                 t.knock(1 if t.x > self.x else -1, 24)
             for a in range(18):
                 ang = a / 18 * math.tau
-                particles.append([self.x + math.cos(ang) * 60, self.y - 70 + math.sin(ang) * 22,
-                                  math.cos(ang) * 140, math.sin(ang) * 60, 0.4, 0.4, self.b, 5, 0])
+                spawn(self.x + math.cos(ang) * 60, self.y - 70 + math.sin(ang) * 22,
+                      math.cos(ang) * 140, math.sin(ang) * 60, 0.4, self.b, 5, 0.0)
             add_shake(4)
         elif k == "area":
             zones.append(Zone(t.x, t.y, ks(120), self.b, 2.6, d, t))
@@ -1635,8 +1766,8 @@ class Fighter:
                 floaters.append(FloatingText(t.x, t.y - 150, "ROOTED", GOLD, S))
                 for a in range(14):
                     ang = a / 14 * math.tau
-                    particles.append([t.x + math.cos(ang) * 42, t.y + math.sin(ang) * 16,
-                                      0, 0, 1.5, 1.5, GOLD, 4, 0])
+                    spawn(t.x + math.cos(ang) * 42, t.y + math.sin(ang) * 16,
+                          0, 0, 1.5, GOLD, 4, 0.0, 0.0)
         elif k == "heal":
             self.heal(damage)
         elif k == "hzone":
@@ -1649,8 +1780,7 @@ class Fighter:
                 got = self.deal(t, damage, True)
                 self.heal(got * 0.6)
                 for a in range(12):
-                    particles.append([t.x, t.y - 90, (self.x - t.x) * 1.6, -60, 0.6, 0.6,
-                                      self.b, 5, -40])
+                    spawn(t.x, t.y - 90, (self.x - t.x) * 1.6, -60, 0.6, self.b, 5, -40.0)
         elif k == "random":
             r = random.randint(1, 6)
             floaters.append(FloatingText(self.x, self.y - 175, f"ROLL {r}", GOLD, M))
@@ -1670,9 +1800,8 @@ class Fighter:
         self.x = max(MARGIN_X, min(W - MARGIN_X, self.x + self.facing * length))
         for i in range(12):                                    # after-image trail
             f = i / 12
-            particles.append([ox + (self.x - ox) * f, oy - 80 + random.uniform(-22, 22),
-                              -self.facing * 60, random.uniform(-30, 30),
-                              0.35, 0.35, self.b, 6, 40])
+            spawn(ox + (self.x - ox) * f, oy - 80 + random.uniform(-22, 22),
+                  -self.facing * 60, random.uniform(-30, 30), 0.35, self.b, 6, 40.0)
         self.skel.snap_feet()
         if abs(t.x - self.x) < ks(130) and abs(t.y - self.y) < ks(60):
             t.hit(damage)
@@ -1748,7 +1877,13 @@ class Fighter:
         moved = math.hypot(self.x - self.px, self.y - self.py)
         self.moving = moved > 0.4
         self.px, self.py = self.x, self.y
+        prev_plant = self.skel.last_plant
         self.skel.update(dt)
+        if self.skel.last_plant is not prev_plant and self.skel.last_plant:
+            fx, fy = self.skel.last_plant
+            if math.hypot(self.vx, self.vy) > 40:
+                dust(fx, fy, self.scale() / KS)
+                sfx("step", 0.35)
 
         if self.buffer_t > 0:
             self.buffer_t -= dt
@@ -1774,8 +1909,8 @@ class Fighter:
         for i in range(4):
             self.cd[i] = max(0.0, self.cd[i] - dt)
         if self.buff > 0 and random.random() < dt * 18:
-            particles.append([self.x + random.uniform(-24, 24), self.y - random.uniform(0, 130),
-                              0, -70, 0.5, 0.5, GOLD, 4, -40])
+            spawn(self.x + random.uniform(-24, 24), self.y - random.uniform(0, 130),
+                  0, -70, 0.5, GOLD, 4, -40.0)
         if self.atk > 0 and self.atype in ("punch", "kick") and not self.attack_landed:
             target = e if self.player else p
             if target:
@@ -2296,7 +2431,7 @@ def apply_loadout(fighter):
 
 
 def start():
-    global p, e, state, timer, particles, shots, zones, floaters, result, intro, ko_timer, sim_acc
+    global p, e, state, timer, shots, zones, floaters, result, intro, ko_timer, sim_acc
     p = Fighter(names[pick], ks(380), ks(505), 1)
     apply_loadout(p)
     e = Fighter(random.choice([n for n in names if n != p.n]), ks(900), ks(505), 0)
@@ -2305,9 +2440,11 @@ def start():
     timer = CFG.game.round_time
     intro = CFG.game.intro_time
     ko_timer = 0.0
-    particles = []; shots = []; zones = []; floaters = []
+    _p_live[0] = 0
+    shots = []; zones = []; floaters = []
     result = ""
     cam.snap(p, e)
+    start_ambient()
     say("FIGHT!", 1.1)
     sfx("ui")
 
@@ -2360,15 +2497,68 @@ def finish():
     state = "result"
 
 
+def update_particles(dt):
+    """One pass: integrate, then compact live slots to the front."""
+    n = _p_live[0]
+    out = 0
+    for i in range(n):
+        a = particles[i]
+        a[P_LIFE] -= dt
+        if a[P_LIFE] <= 0:
+            continue
+        a[P_VY] += a[P_GRAV] * dt
+        if a[P_DRAG]:
+            d = 1.0 - a[P_DRAG] * dt
+            if d < 0.0:
+                d = 0.0
+            a[P_VX] *= d
+            a[P_VY] *= d
+        a[P_X] += a[P_VX] * dt
+        a[P_Y] += a[P_VY] * dt
+        if a[P_KIND] == K_RAIN and a[P_Y] >= GROUND_BOTTOM + 40:
+            if random.random() < CFG.fx.splash_chance:
+                for _ in range(2):
+                    spawn(a[P_X], GROUND_BOTTOM + 40, random.uniform(-55, 55),
+                          random.uniform(-110, -40), 0.22, (120, 150, 170), 2, 900.0)
+            continue
+        if out != i:
+            particles[out], particles[i] = particles[i], particles[out]
+        out += 1
+    _p_live[0] = out
+
+
+def spawn_weather():
+    w = CFG.fx.weather
+    if w == "none":
+        return
+    want = CFG.fx.weather_count
+    have = sum(1 for i in range(_p_live[0]) if particles[i][P_KIND] == K_RAIN)
+    for _ in range(min(14, want - have)):
+        x = random.uniform(-200, WW + 200)
+        y = random.uniform(HORIZON - 260, HORIZON)
+        if w == "rain":
+            spawn(x, y, random.uniform(-70, -30), CFG.fx.rain_speed * random.uniform(0.85, 1.15),
+                  3.0, (150, 178, 200), 1.6, 0.0, 0.0, K_RAIN)
+        else:
+            spawn(x, y, random.uniform(-30, 30), random.uniform(60, 120),
+                  6.0, (208, 218, 232), 2.4, 0.0, 0.0, K_RAIN)
+
+
+def spawn_ambient():
+    if random.random() > CFG.fx.ambient_rate:
+        return
+    near = random.random() < 0.5
+    x = random.uniform(0, WW)
+    y = random.uniform(HORIZON - 40, GROUND_BOTTOM + 30)
+    spawn(x, y, random.uniform(-14, 14), random.uniform(-22, -6),
+          2.4 + random.random() * 2.2, (86, 104, 120) if near else (52, 64, 78),
+          2.6 if near else 1.6, -3.0, 0.2, K_MOTE)
+
+
 def update_world(dt):
-    for a in particles[:]:
-        a[0] += a[2] * dt
-        a[1] += a[3] * dt
-        a[3] += a[8] * dt
-        a[2] *= max(0.0, 1 - dt * 1.4)
-        a[4] -= dt
-        if a[4] <= 0:
-            particles.remove(a)
+    update_particles(dt)
+    spawn_weather()
+    spawn_ambient()
     for a in shots[:]:
         a.up(dt)
         if a.life <= 0:
@@ -2383,17 +2573,32 @@ def update_world(dt):
             floaters.remove(a)
 
 
+def draw_particles():
+    for i in range(_p_live[0]):
+        a = particles[i]
+        f = a[P_LIFE] / a[P_MAX]
+        kind = a[P_KIND]
+        col = (int(a[P_R] * (0.4 + 0.6 * f)), int(a[P_G] * (0.4 + 0.6 * f)),
+               int(a[P_B] * (0.4 + 0.6 * f)))
+        if kind == K_RAIN:
+            ln = CFG.fx.rain_len
+            pygame.draw.line(screen, col, (a[P_X], a[P_Y]),
+                             (a[P_X] - a[P_VX] * 0.012, a[P_Y] - ln), 1)
+        elif kind == K_SMOKE or kind == K_DUST:
+            r = max(1, int(a[P_SZ] * (1.6 - f * 0.6)))
+            pygame.draw.circle(screen, col, (int(a[P_X]), int(a[P_Y])), r)
+        else:
+            r = max(1, int(a[P_SZ] * f))
+            pygame.draw.circle(screen, col, (int(a[P_X]), int(a[P_Y])), r)
+
+
 def draw_world(t):
     if CFG.post.enabled:
         EMIS.fill((0, 0, 0), cam.view_rect())   # only what bloom will sample
     arena(t)
     for z in zones:
         z.draw()
-    for a in particles:
-        if a[4] > 0:
-            k = a[4] / a[5]
-            r = max(1, int(a[7] * k))
-            pygame.draw.circle(screen, shade(a[6], 0.4 + 0.6 * k), ipt((a[0], a[1])), r)
+    draw_particles()
     for fighter in sorted((p, e), key=lambda z: z.y):   # depth ordering
         fighter.draw()
     for a in shots:
@@ -2451,6 +2656,7 @@ def frame(events, dt, t):
             elif state == "fight":
                 if ev.key == pygame.K_ESCAPE:
                     state = "menu"
+                    stop_ambient()
                 elif ev.key in (pygame.K_1, pygame.K_KP1):
                     p.ability(0, e)
                 elif ev.key in (pygame.K_2, pygame.K_KP2):
@@ -2583,7 +2789,7 @@ def debug_overlay():
         (f"{worst:5.2f} ms  worst of last {len(frame_ms)}",
          GREEN if worst < 16.67 else GOLD),
         (f"budget 16.67 ms   headroom {16.67 - avg:5.2f} ms", DIM),
-        (f"particles {len(particles):<4} shots {len(shots):<3} "
+        (f"particles {_p_live[0]:<4}/{CFG.fx.pool} shots {len(shots):<3} "
          f"zones {len(zones):<3} floaters {len(floaters)}", DIM),
         (f"glow cache {len(_glow_cache)}/{CFG.glow.cache_max}   state {state}", DIM),
     ]
